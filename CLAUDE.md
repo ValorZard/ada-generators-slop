@@ -97,6 +97,139 @@ possibly the same object because the indices are not static. `Transfer`'s
 precondition requires `From /= To`. Written out with `pragma Annotate` at the
 call site.
 
+## Proof warnings: where this stands (2026-09-06)
+
+**Status: the default proof run is clean. The extended run is not, and the
+work to clean it is unfinished.** Read this before touching `Resume`, `Yield`,
+`Switch_To` or `Transfer`.
+
+### Done
+
+`minicoro-code_page__posix.adb` no longer spells `MAP_FAILED` as
+`System'To_Address (-1)`. `Integer_Address` is modular (`mod Memory_Size`, see
+`s-stoele.ads`), so a negative literal is out of range and GNATprove's
+frontend reported "value not in range ... Constraint_Error will be raised at
+run time" — on the success path of *every* `Allocate`. GNAT folds the static
+attribute and the code always worked, but the warning was real noise. It is
+now `To_Address (Integer_Address'Last)`, which is the same all-ones address
+said in a way both tools accept. The default run emits **zero** warnings.
+
+This fix is *uncommitted* at the time of writing; everything else described
+below is unstarted.
+
+### The extended run
+
+Two warning families are off by default. Turn them on:
+
+```sh
+cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail \
+  --pedantic --proof-warnings=on
+```
+
+Still `Success: all checks proved (482 checks)`, but **20 warnings**. They
+fall into three groups, and the middle one is the only one that matters.
+
+### 1. `pragma Assume is always False` — a real defect, unfixed
+
+Five warnings (`minicoro.adb:321,322,367,368,405`) plus four
+`unreachable branch`/`unreachable code` ones
+(`minicoro.ads:151,157,164`, `minicoro.adb:289`). All but the last share one
+root cause.
+
+`Transfer` never assigns `Current`, so SPARK's inferred `Global` for it does
+not mention `Current` and the prover concludes it is unchanged across the
+call. But `Resume` sets `Current := C` *before* calling `Transfer`, and the
+guard above it rules out `C = Prev`. So:
+
+```ada
+Current := C;
+Transfer (Prev, C);
+pragma Assume (Current = Prev);   --  provably False
+```
+
+The assumption contradicts what the prover derived. **A contradictory
+`pragma Assume` makes everything after it vacuously provable** — which is why
+the postconditions of `Resume`, `Yield` and `Switch_To` are reported as
+unreachable branches. Those three postconditions are *not actually verified
+today*. The 482 figure is not wrong, but it counts three vacuous contracts.
+
+`Yield` (`Current := Prev` then `Assume (Current = C)`) and `Switch_To`
+(`Current := Target` then `Assume (Current = Cur)`) fail the same way. The
+second assume in each pair (`321`/`322`, `367`/`368`) is flagged only because
+it sits downstream of the first — fix the first and the second should go
+quiet on its own.
+
+**Intended fix.** Stop pretending `Transfer` returns with the pool as it left
+it, and model the control transfer honestly: after the switch, `Current` and
+`Coros` should be *unknown*, not preserved. The plan was a body-local helper
+whose contract declares the effect and whose body is opaque to SPARK, called
+at the end of `Transfer` right after `Contexts.Switch` returns:
+
+```ada
+   procedure Control_Transferred
+     with Global => (In_Out => (Coros, Current));
+   --  body: pragma SPARK_Mode (Off); null;
+```
+
+With `Current` havoc'd, the three `pragma Assume`s become genuine
+restorations instead of contradictions, and the postconditions get proved
+from them for real. Do not write an explicit `Global` on `Transfer` itself —
+it would have to enumerate `Main_Ctx` and `Contexts.Backend_State`, and the
+child's state is deliberately `Part_Of => Minicoro.Pool` so that callers do
+not have to name it.
+
+**Risk, and why this was not just done:** havocking `Coros` makes every pool
+fact unknown after a `Transfer`, so proofs that currently lean on those facts
+may start failing and need their own assumptions. The three call sites do
+almost nothing after `Transfer` (they assign `Res` and return), so the blast
+radius *looks* small — but `Trampoline` also calls `Transfer`
+(`minicoro.adb:437`) and was not analysed. Budget a few proof cycles.
+
+`minicoro.adb:289` (`Res := Not_Suspended`) is separate and is **not a bug**:
+`Resume`'s precondition is `Status (C) = Suspended`, so the guard is dead for
+SPARK-proved callers. It stays — `Coroutines` is not SPARK and can violate
+that precondition. If the warning needs silencing, justify it in place rather
+than deleting the check.
+
+### 2. `operator-reassociation` — 11 warnings, cosmetic, deliberately deferred
+
+`--pedantic` only. Ada (RM 4.5) lets a compiler reassociate a chain of
+same-precedence predefined operators, so `A + B + C` may be evaluated as
+`A + (B + C)`; the prover assumed left-to-right. It can only *change* anything
+if an intermediate overflows, and none of these can — they are byte-range
+encoder arithmetic and small index sums.
+
+Sites: `minicoro.adb:461,486,512` (`Base + 1 + (I - Src'First)`),
+`minicoro-machine_code.adb:24` (`REX`), `:31` (`Mod_RM`), `:63` (`Put_Disp`'s
+precondition), `:178`, `:203`, `:243` (`P + 3 + Disp_Size (M)`),
+`minicoro-machine_code.ads:148` (`Subprogram_Variant`), `:238`
+(`Decode_Disp32`).
+
+The fix is pure parenthesisation — `(P + 3) + Disp_Size (M)`,
+`(Base + 1) + (I - Src'First)`, `(L'Last + 1) - Index` — semantically neutral
+and safe. It was drafted and pulled back before landing; `REX` and
+`Decode_Disp32` are the only ugly ones, needing a nested-paren cascade over
+four and five terms. Decide whether pinning the association is worth the
+noise before redoing it.
+
+### 3. `info:` lines are not warnings
+
+`cannot unroll loop (too many loop iterations)` at `minicoro.adb:215,511` and
+`unrolling loop` at `minicoro-machine_code.adb:333`. Informational; the loops
+carry invariants and prove fine. Nothing to do.
+
+### Resuming
+
+1. Commit or re-apply the `MAP_FAILED` fix.
+2. Re-run the extended command above to confirm the 20 warnings still stand.
+3. Do family 1 first — it is the only one with verification consequences.
+   After it lands, re-check that `Resume`/`Yield`/`Switch_To` postconditions
+   are genuinely proved (they should stop being reported as unreachable
+   branches) and re-run `alr test`: these are the coroutine lifecycle paths,
+   so the 27-case suite is the check that the model change did not alter
+   behaviour.
+4. Family 2 is independent and can be skipped or done at leisure.
+
 ## Traps that cost time
 
 **Ada in bash heredocs.** Tick attributes (`X'First`, `T'Access`) break
@@ -209,6 +342,14 @@ Assumed, each marked in the source with its reasoning:
    returns with globals untouched; in reality control ran elsewhere first.
    `Resume`, `Yield` and `Switch_To` each carry `pragma Assume` re-establishing
    what the counterpart restores.
+
+   These three assumptions are currently **contradictory**, not merely
+   unproved: `Transfer` does not write `Current`, so the prover knows the
+   value the caller just stored and the assume denies it. Everything after
+   them is therefore vacuously provable, which costs the postconditions of
+   `Resume`, `Yield` and `Switch_To`. `--proof-warnings=on` reports it; the
+   fix is drafted under "Proof warnings: where this stands". Until then,
+   read those three contracts as claims, not results.
 3. Stack disjointness across separate heap allocations.
 
 If you touch `Resume`/`Yield`/`Switch_To`/`Trampoline`, re-check that the
@@ -267,12 +408,9 @@ destroyed while the coroutine ran.
   with the System V switch routine. macOS and the BSDs are still untested —
   `MAP_ANONYMOUS` differs there and `On_Linux` picks the value by inspecting
   `Standard'Target_Name`.
-- GNATprove warns on `minicoro-code_page__posix.adb:74`, where `MAP_FAILED` is
-  written `System'To_Address (-1)`, that `Constraint_Error` will be raised.
-  It is not: GNAT folds the static attribute to the all-ones address, and the
-  line is on the success path of every `Allocate` the testsuite performs. The
-  warning is the SPARK frontend being stricter than the compiler about a unit
-  that is `SPARK_Mode => Off` anyway. Left alone; it costs a proof warning,
-  not a check.
-- Nothing is committed. The user pushes to their own fork
+- Twenty warnings remain under `--pedantic --proof-warnings=on` (9 in the
+  assume/unreachable family, 11 reassociation), and three postconditions are
+  vacuously proved because of them. See "Proof warnings: where this stands"
+  above — that is the open work.
+- The user pushes to their own fork
   (`https://github.com/ValorZard/ada-generators-slop.git`) themselves.

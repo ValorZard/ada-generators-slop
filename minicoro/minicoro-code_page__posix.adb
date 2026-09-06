@@ -27,6 +27,16 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
      (if On_Linux then 16#20# else 16#1000#);
    --  0x20 on Linux, 0x1000 on the BSDs and macOS.
 
+   MAP_FAILED : constant System.Address :=
+     To_Address (Integer_Address'Last);
+   --  What mmap returns on failure: (void*)-1, the all-ones address, not
+   --  null. Integer_Address is modular ("type Integer_Address is mod
+   --  Memory_Size" in s-stoele.ads), so 'Last is that value. Spelling it
+   --  System'To_Address (-1) instead means passing a negative literal to a
+   --  modular type: the compiler folds it to the same address, but
+   --  GNATprove's frontend reports it as a Constraint_Error that will be
+   --  raised at run time -- on the success path of every Allocate.
+
    function mmap
      (Addr   : System.Address;
       Length : Size_T;
@@ -69,10 +79,7 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
         (System.Null_Address, Size_T (Size),
          PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0);
 
-      --  mmap reports failure as MAP_FAILED, which is (void*)-1, not null.
-      if Addr = System.Null_Address
-        or else Addr = System'To_Address (-1)
-      then
+      if Addr = System.Null_Address or else Addr = MAP_FAILED then
          Ok := False;
          return;
       end if;
