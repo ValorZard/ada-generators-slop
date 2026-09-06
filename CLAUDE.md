@@ -717,6 +717,93 @@ elaboration by typed encoders and written into a W^X page. There is no
 hand-written byte table anywhere in `minicoro/` — the only byte table is
 `tests/golden_win64.ads`, which is minicoro's, used as the oracle.
 
+## Threading model
+
+**Single-threaded, and load-bearing.** Every one of the 648 checks is proved
+under the assumption that one thread of control touches this library. Nothing
+in the tree creates a task, and there is not a single `protected`, `Atomic` or
+`Interrupt` construct in it — the only `Volatile` is `Anchor` in
+`Adopt_Current`, which is about observing a stack, not about concurrency.
+
+All the state is unsynchronised globals: `Current`, `Main_Ctx`, `Backend_Up`,
+`Coros` and `Stores` in `Minicoro`; `Registry` and `Sched_State` in
+`Coroutines`; the four arrays in `Generator_Slots`. Two Ada tasks using any of
+this concurrently would race on all of it.
+
+The sharpest failure is not the pool but `Main_Ctx`. `Ensure_Backend` adopts
+the caller's stack *once*, guarded by `Backend_Up`, so whichever task gets
+there first has its stack recorded as "the main context". A second task
+switching would install the first task's stack pointer while running on its
+own — silent corruption, not an exception.
+
+One asymmetry to know about, because it is worse than being uniformly
+single-threaded: the secondary-stack handling in `Coroutines.Raw` goes through
+`System.Soft_Links`, which *is* per-task in a tasking runtime. So the piece
+that looks most runtime-integrated is the one piece that would behave
+correctly under tasks, while everything around it silently would not.
+
+### Reproducing the guarantee
+
+For SPARK clients this is enforced, not merely documented — GNATprove rejects
+it. SPARK needs both pragmas below before it will look at tasking at all
+(`tasking in SPARK requires Ravenscar profile`, then `requires sequential
+elaboration`):
+
+```ada
+--  conf.adc, referenced from the .gpr as
+--  package Builder is for Global_Configuration_Pragmas use "conf.adc"; end;
+pragma Profile (Ravenscar);
+pragma Partition_Elaboration_Policy (Sequential);
+```
+
+With those, a program where two tasks reach the library gets:
+
+```
+high: possible data race when accessing variable "minicoro.pool"
+  + task "main" accesses "minicoro.pool"
+  + task "racer.w" accesses "minicoro.pool"
+```
+
+reported once per abstract state — `minicoro.pool`, `minicoro.storage` and
+`minicoro.backend` separately, which is a direct dividend of splitting that
+state up. Note the check only fires when *two* tasks actually reach the state;
+a single task touching it raises nothing.
+
+This covers SPARK clients only. An ordinary Ada program gets no diagnostic.
+
+### Per-task pools: investigated, not viable as things stand
+
+Making the pools genuinely per-task — so that no affinity check is needed and
+a single-threaded program pays nothing — was tried. `pragma
+Thread_Local_Storage` is the obvious mechanism and it does work in principle;
+a `Natural` behind it gives each task its own copy, verified by experiment.
+
+It cannot be applied to these pools:
+
+```
+error: Thread_Local_Storage variable "Pool" is improperly initialized
+error: only allowed initialization is explicit "null", static expression or
+       static aggregate
+```
+
+Every pool here has default component values, and `Coroutines.Excs` is an
+array of `Exception_Occurrence`, so all of them are rejected. Stripping the
+defaults to satisfy the pragma would reintroduce exactly the initialisation
+problem that the `Initializes` contracts were added to catch.
+
+Two further obstacles, for the record. GNATprove does not model
+`Thread_Local_Storage`, so it would keep reporting the data race above as a
+false positive; and it cannot be silenced with `Abstract_State => (S with
+Synchronous)`, because that requires *"constituent of synchronized state must
+be synchronized"* — atomic or protected, neither of which a thread-local array
+is.
+
+The remaining route to real per-task pools is to stop having global state at
+all: pass an explicit scheduler object to every operation, so each task
+creates its own. That is zero-cost, is the best possible SPARK story (no
+globals means no data races by construction), and is a rewrite of the public
+API of all three layers plus all 27 tests. It has not been attempted.
+
 ## What is proved vs assumed
 
 Proved: all of `Machine_Code` (including `Resume_Point_Correct` and the

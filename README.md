@@ -208,7 +208,8 @@ layers):
   reference goes, and `Set_State`/`Set_Owns_Delegate` that they change what
   they name and nothing else.
 
-**Assumed.** Eight things, each marked in the source:
+**Assumed.** Nine things, the first eight marked in the source and the
+ninth true of the whole library:
 
 1. **The generated assembly implements `Contexts.Switch`.** SPARK has no
    semantics for machine instructions, so `Switch`'s postcondition is
@@ -251,6 +252,20 @@ layers):
 8. **The GNAT secondary stack and soft links behave.** Saving, restoring and
    initialising a coroutine's secondary stack goes through
    `System.Soft_Links`, whose effects SPARK cannot see.
+9. **One thread of control.** This is the largest assumption of the lot and
+   the one least visible in the source. Every check above is proved for a
+   single-threaded program: the pools, the "currently running" coroutine and
+   the adopted main context are all unsynchronised globals, and the library
+   contains no `task`, `protected` or `Atomic` construct anywhere. Two Ada
+   tasks reaching it would race on all of it, and the first symptom would be
+   silent — a task switching onto a stack pointer another task adopted.
+
+   For SPARK clients this is enforced rather than merely assumed: with
+   `pragma Profile (Ravenscar)` and `Partition_Elaboration_Policy
+   (Sequential)`, GNATprove reports `possible data race when accessing
+   variable "minicoro.pool"` and refuses. An ordinary Ada client gets no
+   such diagnostic. See "Threading model" in `CLAUDE.md`, which also records
+   why per-task pools are not currently available.
 
 The **justified** checks are two, both written out with `pragma Annotate` at
 the site and both showing up in GNATprove's report rather than being silently
