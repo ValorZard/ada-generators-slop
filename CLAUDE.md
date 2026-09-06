@@ -202,9 +202,9 @@ header comment, so the status is declared rather than merely defaulted.
 
 ## Proof warnings: where this stands (2026-09-06)
 
-**Status: all checks prove, in both the default and the extended run. The
-`pragma Assume is always False` family below is a real defect and is still
-open.** Read this before touching `Resume`, `Yield`, `Switch_To` or
+**Status: all checks prove, in both the default and the extended run, and
+none of them vacuously.** The `pragma Assume is always False` family is
+fixed. Read this before touching `Resume`, `Yield`, `Switch_To` or
 `Transfer`.
 
 ### The extended run
@@ -216,30 +216,28 @@ cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail \
   --pedantic --proof-warnings=on
 ```
 
-Still `Success: all checks proved (579 checks)`, but **29 warnings**:
+`Success: all checks proved (579 checks)` and **21 warnings**:
 
 | Count | Kind                                    | Group |
 |-------|-----------------------------------------|-------|
 | 11    | `operator-reassociation`                | 2     |
-| 5     | `pragma Assume is always False`         | 1     |
-| 3     | `unreachable branch`                    | 1     |
-| 2     | `unreachable code`                      | 1, 4  |
 | 7     | `Code_Page` overlay family              | 3     |
+| 2     | `unreachable code`                      | 1, 4  |
 | 1     | `representation-attribute-value`        | 5     |
 
-Group 1 is the only one with verification consequences.
+None of them has verification consequences any more.
 
-### 1. `pragma Assume is always False` — a real defect, unfixed
+### 1. `pragma Assume is always False` — fixed
 
-Five warnings (`minicoro.adb:348,349,394,395,432`) plus four
-`unreachable branch`/`unreachable code` ones
-(`minicoro.ads:155,161,168`, `minicoro.adb:316`). All but the last share one
-root cause.
+**This was a real defect and it is now closed.** It cost the postconditions of
+`Resume`, `Yield` and `Switch_To`, which were reported as unreachable
+branches and were therefore *not verified* despite appearing in the check
+count. They are verified now.
 
-`Transfer` never assigns `Current`, so SPARK's inferred `Global` for it does
-not mention `Current` and the prover concludes it is unchanged across the
-call. But `Resume` sets `Current := C` *before* calling `Transfer`, and the
-guard above it rules out `C = Prev`. So:
+The cause: `Transfer` never assigned `Current`, so SPARK's inferred `Global`
+for it did not mention `Current` and the prover concluded it was unchanged
+across the call. But `Resume` sets `Current := C` *before* calling
+`Transfer`, and the guard above it rules out `C = Prev`. So:
 
 ```ada
 Current := C;
@@ -247,23 +245,15 @@ Transfer (Prev, C);
 pragma Assume (Current = Prev);   --  provably False
 ```
 
-The assumption contradicts what the prover derived. **A contradictory
-`pragma Assume` makes everything after it vacuously provable** — which is why
-the postconditions of `Resume`, `Yield` and `Switch_To` are reported as
-unreachable branches. Those three postconditions are *not actually verified
-today*. The 579 figure is not wrong, but it counts three vacuous contracts.
+A contradictory `pragma Assume` makes everything after it vacuously
+provable. `Yield` (`Current := Prev` then `Assume (Current = C)`) and
+`Switch_To` (`Current := Target` then `Assume (Current = Cur)`) failed the
+same way, and the second assume in each pair was flagged only for sitting
+downstream of the first.
 
-`Yield` (`Current := Prev` then `Assume (Current = C)`) and `Switch_To`
-(`Current := Target` then `Assume (Current = Cur)`) fail the same way. The
-second assume in each pair (`348`/`349`, `394`/`395`) is flagged only because
-it sits downstream of the first — fix the first and the second should go
-quiet on its own.
-
-**Intended fix.** Stop pretending `Transfer` returns with the pool as it left
-it, and model the control transfer honestly: after the switch, `Current` and
-`Coros` should be *unknown*, not preserved. The plan was a body-local helper
-whose contract declares the effect and whose body is opaque to SPARK, called
-at the end of `Transfer` right after `Contexts.Switch` returns:
+**The fix**, in `minicoro.adb`: a helper whose contract declares the effect
+and whose body is opaque to SPARK, called at the end of `Transfer` the
+instant `Contexts.Switch` returns.
 
 ```ada
    procedure Control_Transferred
@@ -271,21 +261,24 @@ at the end of `Transfer` right after `Contexts.Switch` returns:
    --  body: pragma SPARK_Mode (Off); null;
 ```
 
-With `Current` havoc'd, the three `pragma Assume`s become genuine
-restorations instead of contradictions, and the postconditions get proved
-from them for real. Do not write an explicit `Global` on `Transfer` itself —
-it would have to enumerate `Main_Ctx` and `Contexts.Backend_State`, and the
-child's state is deliberately `Part_Of => Minicoro.Pool` so that callers do
-not have to name it.
+With `Current` and `Coros` havoc'd, the three `pragma Assume`s stopped being
+contradictions and became genuine restorations, and the postconditions are
+proved from them for real. The helper compiles to nothing, so there is no
+runtime effect; the 27-case suite was re-run to confirm it.
 
-**Risk, and why this was not just done:** havocking `Coros` makes every pool
-fact unknown after a `Transfer`, so proofs that currently lean on those facts
-may start failing and need their own assumptions. The three call sites do
-almost nothing after `Transfer` (they assign `Res` and return), so the blast
-radius *looks* small — but `Trampoline` also calls `Transfer`
-(`minicoro.adb:437`) and was not analysed. Budget a few proof cycles.
+Do not write an explicit `Global` on `Transfer` itself — it would have to
+enumerate `Main_Ctx` and `Contexts.Backend_State`, and the child's state is
+deliberately `Part_Of => Minicoro.Pool` so that callers do not have to name
+it. Letting inference pick `Current` up from `Control_Transferred` is the
+whole trick.
 
-`minicoro.adb:316` (`Res := Not_Suspended`) is separate and is **not a bug**:
+The feared blast radius did not materialise. Havocking `Coros` makes every
+pool fact unknown after a `Transfer`, but all three call sites do nothing
+afterwards except assign `Res` and return, and `Trampoline` — the fourth
+caller, which had not been analysed when the risk was written down — ends in
+its unreachable spin. Nothing downstream needed the facts that went away.
+
+`minicoro.adb:352` (`Res := Not_Suspended`) is separate and is **not a bug**:
 `Resume`'s precondition is `Status (C) = Suspended`, so the guard is dead for
 SPARK-proved callers. It stays — `Coroutines` is not SPARK and can violate
 that precondition. If the warning needs silencing, justify it in place rather
@@ -299,7 +292,7 @@ same-precedence predefined operators, so `A + B + C` may be evaluated as
 if an intermediate overflows, and none of these can — they are byte-range
 encoder arithmetic and small index sums.
 
-Sites: `minicoro.adb:483,508,534` (`Base + 1 + (I - Src'First)`),
+Sites: `minicoro.adb:519,544,570` (`Base + 1 + (I - Src'First)`),
 `minicoro-machine_code.adb:24` (`REX`), `:31` (`Mod_RM`), `:63` (`Put_Disp`'s
 precondition), `:178`, `:203`, `:243` (`P + 3 + Disp_Size (M)`),
 `minicoro-machine_code.ads:148` (`Subprogram_Variant`), `:238`
@@ -358,15 +351,12 @@ Informational; the loops carry invariants and prove fine. Nothing to do.
 
 ### Resuming
 
-1. Re-run the extended command above to confirm the 29 warnings still stand.
-2. Do family 1 first — it is the only one with verification consequences.
-   After it lands, re-check that `Resume`/`Yield`/`Switch_To` postconditions
-   are genuinely proved (they should stop being reported as unreachable
-   branches) and re-run `alr test`: these are the coroutine lifecycle paths,
-   so the 27-case suite is the check that the model change did not alter
-   behaviour.
-3. Family 2 is independent and can be skipped or done at leisure. Families
-   3, 4 and 5 are tool limitations or deliberate trades, not work items.
+Family 1 is done. Family 2 is independent and can be skipped or done at
+leisure; families 3, 4 and 5 are tool limitations or deliberate trades, not
+work items. If you touch the lifecycle again, re-run the extended command
+above and confirm the count is still 21 with no `pragma Assume is always
+False` among them — that warning reappearing is the signal that the re-entry
+model has drifted.
 
 ## Traps that cost time
 
@@ -478,18 +468,19 @@ that cannot be SPARK".
 Assumed, each marked in the source with its reasoning:
 1. The generated assembly implements `Contexts.Switch`'s contract. SPARK has no
    machine semantics.
-2. **Coroutine re-entry.** SPARK models `Transfer` as an ordinary call that
-   returns with globals untouched; in reality control ran elsewhere first.
-   `Resume`, `Yield` and `Switch_To` each carry `pragma Assume` re-establishing
-   what the counterpart restores.
+2. **Coroutine re-entry.** Control really did run elsewhere between the
+   `Contexts.Switch` inside `Transfer` and the return from it.
+   `Transfer` ends by calling `Control_Transferred`, whose contract havocs
+   `Coros` and `Current`, so the prover treats the pool and the running
+   coroutine as unknown afterwards. `Resume`, `Yield` and `Switch_To` then
+   each carry a `pragma Assume` restoring what the counterpart routine
+   establishes before switching back.
 
-   These three assumptions are currently **contradictory**, not merely
-   unproved: `Transfer` does not write `Current`, so the prover knows the
-   value the caller just stored and the assume denies it. Everything after
-   them is therefore vacuously provable, which costs the postconditions of
-   `Resume`, `Yield` and `Switch_To`. `--proof-warnings=on` reports it; the
-   fix is drafted under "Proof warnings: where this stands". Until then,
-   read those three contracts as claims, not results.
+   These are genuine assumptions about the counterpart's behaviour, and the
+   postconditions of all three are proved *from* them. They used to be
+   contradictions, which made everything downstream vacuously provable; see
+   "Proof warnings: where this stands" for what that cost and how it was
+   fixed.
 3. Stack disjointness across separate heap allocations.
 4. **`Trampoline`'s precondition.** It says Handle is the pool index `Create`
    encoded, that the slot is live, and that its resumer is neither itself nor
@@ -562,10 +553,8 @@ destroyed while the coroutine ran.
   with the System V switch routine. macOS and the BSDs are still untested —
   `MAP_ANONYMOUS` differs there and `On_Linux` picks the value by inspecting
   `Standard'Target_Name`.
-- The `pragma Assume is always False` family is still open, so three
-  postconditions (`Resume`, `Yield`, `Switch_To`) are still vacuously proved.
-  See "Proof warnings: where this stands" — that is the open work, and it is
-  unaffected by the SPARK_Mode expansion.
+- Eleven `operator-reassociation` warnings remain under `--pedantic`. Purely
+  cosmetic; see "Proof warnings", family 2.
 - `coroutines/` and `generators/` are `SPARK_Mode => Off` and staying that
   way; putting them in SPARK means replacing `Ada.Finalization.Controlled`
   ref-counting with something SPARK accepts, which is a rewrite of both

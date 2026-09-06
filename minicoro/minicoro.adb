@@ -89,6 +89,23 @@ is
                    and then Ready
                    and then (if To /= No_Coroutine then Coros (To).In_Use);
 
+   procedure Control_Transferred
+     with Global => (In_Out => (Coros, Current));
+   --  Called by Transfer the instant Contexts.Switch returns. The body is
+   --  empty and outside SPARK, so the prover learns nothing from it and
+   --  everything from this contract: the pool and the identity of the running
+   --  coroutine may have changed arbitrarily.
+   --
+   --  That is the honest model of a context switch, and it is what makes the
+   --  three "coroutine re-entry" assumptions below meaningful. Without it
+   --  SPARK reasons as though Transfer returned with the globals it was
+   --  handed -- so it still knows the value the caller stored into Current a
+   --  line earlier, and each Assume then *contradicts* what it derived. A
+   --  contradictory Assume makes everything after it vacuously provable,
+   --  which silently cost Resume, Yield and Switch_To their postconditions.
+   --  With Current and Coros havoc'd the same three assumptions become
+   --  genuine restorations, and those postconditions are proved for real.
+
    procedure Ensure_Backend (Ok : out Boolean)
      with Post => (if Ok then Ready);
 
@@ -191,7 +208,26 @@ is
             & "anti-aliasing rule is syntactic and treats any two indexed "
             & "components with non-static indices as possibly the same.");
       end if;
+
+      --  Control left this thread of execution at the Switch above and has
+      --  only just come back, having run inside another coroutine in the
+      --  meantime. Say so.
+      Control_Transferred;
    end Transfer;
+
+   -------------------------
+   -- Control_Transferred --
+   -------------------------
+
+   procedure Control_Transferred is
+      pragma SPARK_Mode (Off);
+      --  Deliberately empty. What it models already happened, in the
+      --  generated switch routine, while control was elsewhere; there is
+      --  nothing left to execute. Off so that SPARK cannot see that and must
+      --  take the declared Global at its word.
+   begin
+      null;
+   end Control_Transferred;
 
    ----------------------
    -- Trampoline_Entry --

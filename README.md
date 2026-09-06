@@ -172,11 +172,15 @@ analysis, with two justifications (see below).
    assumed of the code, not derived from it. What narrows this gap is that the
    *instruction sequence* is proved well-formed and its resume point proved to
    be an instruction boundary — the part most likely to be silently wrong.
-2. **Coroutine re-entry.** SPARK models `Switch` as an ordinary call that
-   returns with globals untouched. In reality control ran inside another
-   coroutine first. `Resume`, `Yield` and `Switch_To` each carry a
-   `pragma Assume` re-establishing what the counterpart routine restores
-   before switching back, with the reasoning written out at the assumption.
+2. **Coroutine re-entry.** Control ran inside another coroutine between the
+   `Switch` and the return from it. `Transfer` ends by calling
+   `Control_Transferred`, a helper whose contract havocs the pool and the
+   identity of the running coroutine and whose body is outside SPARK, so the
+   prover treats both as unknown once a switch has happened. `Resume`,
+   `Yield` and `Switch_To` each then carry a `pragma Assume` restoring what
+   the counterpart routine establishes before switching back, with the
+   reasoning written out at the assumption — and their postconditions are
+   proved from those assumptions rather than around them.
 3. **Stack disjointness.** `Transfer` assumes distinct pool slots hold
    distinct stack allocations. They do — each is a separate allocation — but
    SPARK cannot see it through the heap.
