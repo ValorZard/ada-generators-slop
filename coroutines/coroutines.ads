@@ -34,9 +34,20 @@ use type System.Storage_Elements.Storage_Offset;
 --  Minicoro already imposes one of its own on *spawned* coroutines, so this
 --  is a change of degree, not of kind.
 
-package Coroutines with SPARK_Mode => On is
+package Coroutines with
+  SPARK_Mode     => On,
+  Abstract_State => (Registry, Sched_State),
+  Initializes    => (Registry, Sched_State)
+is
 
    pragma Elaborate_Body;
+
+   --  Two abstract states rather than one lump, because they have different
+   --  characters and different lifetimes. Registry is who exists: the slot
+   --  pool and the map from Minicoro ids back to slots. Sched_State is what
+   --  is running: the previously-running slot and the one-shot bootstrap
+   --  flag. Keeping them apart means a contract can say it reads the registry
+   --  without also claiming to touch the scheduler, and vice versa.
 
    --  This package provides support for creating coroutines.
 

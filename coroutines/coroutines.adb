@@ -24,7 +24,11 @@ with System.Secondary_Stack;
 with System.Soft_Links;
 pragma Warnings (On);
 
-package body Coroutines with SPARK_Mode => On is
+package body Coroutines with
+  SPARK_Mode    => On,
+  Refined_State => (Registry    => (Pool, By_Coro, Excs),
+                    Sched_State => (Previous_Slot, Booted))
+is
 
    use type System.Secondary_Stack.SS_Stack_Ptr;
    use type Minicoro.Coroutine_Id;
@@ -40,7 +44,7 @@ package body Coroutines with SPARK_Mode => On is
    -- The pool --
    ----------------
 
-   type Coroutine_Record is limited record
+   type Coroutine_Record is record
       Ref_Count  : Natural := 0;
       --  Number of Coroutine handles naming this slot. Once it reaches 0 the
       --  slot is released.
@@ -67,15 +71,23 @@ package body Coroutines with SPARK_Mode => On is
       Is_Main    : Boolean := False;
       Is_Started : Boolean := False;
       To_Clean   : Boolean := False;
-
-      Exc        : Exception_Occurrence;
-      --  When assigned a non-null exception occurrence, the Switch primitive
-      --  must re-raise it when resuming execution.
    end record;
 
    type Pool_Array is array (Valid_Slot) of Coroutine_Record;
 
    Pool : Pool_Array;
+
+   Excs : array (Valid_Slot) of Exception_Occurrence;
+   --  Pending exception per slot: when a slot's occurrence is non-null, the
+   --  Switch primitive must re-raise it when resuming execution.
+   --
+   --  A separate array rather than a component of Coroutine_Record, and the
+   --  reason is not tidiness. Exception_Occurrence is limited private, so
+   --  SPARK cannot see that it is default-initialised; with it inside the
+   --  record, *no* part of Pool counted as initialised and the Initializes
+   --  contract on Registry was unprovable. Split out, every remaining
+   --  component of Coroutine_Record has a default, Pool initialises itself,
+   --  and only this array needs the elaboration loop at the end of the body.
 
    By_Coro : array (Minicoro.Valid_Id) of Slot_Id := [others => No_Slot];
    --  Which slot backs each live Minicoro coroutine. This replaces the old
@@ -229,7 +241,7 @@ package body Coroutines with SPARK_Mode => On is
          raise Abort_Coroutine;
       exception
          when Exc : Abort_Coroutine =>
-            Save_Occurrence (Pool (Slot).Exc, Exc);
+            Save_Occurrence (Excs (Slot), Exc);
       end Capture_Abort;
 
       procedure Save_Sec_Stack (Slot : Valid_Slot) is
@@ -255,7 +267,7 @@ package body Coroutines with SPARK_Mode => On is
             To_Previous := True;
 
          when Exc : others =>
-            Save_Occurrence (Pool (Slot).Exc, Exc);
+            Save_Occurrence (Excs (Slot), Exc);
       end Run_Delegate;
 
    end Raw;
@@ -373,7 +385,7 @@ package body Coroutines with SPARK_Mode => On is
       Pool (Slot).Is_Started := False;
       Pool (Slot).To_Clean   := False;
       Pool (Slot).Coro       := Minicoro.No_Coroutine;
-      Save_Occurrence (Pool (Slot).Exc, Null_Occurrence);
+      Save_Occurrence (Excs (Slot), Null_Occurrence);
 
       --  Drop the counted reference this slot held on its parent. Done last,
       --  and iteratively rather than by recursion, so that a long ancestor
@@ -456,7 +468,7 @@ package body Coroutines with SPARK_Mode => On is
       Pool (Slot).Is_Main    := False;
       Pool (Slot).Is_Started := False;
       Pool (Slot).To_Clean   := False;
-      Save_Occurrence (Pool (Slot).Exc, Null_Occurrence);
+      Save_Occurrence (Excs (Slot), Null_Occurrence);
 
       --  The new slot holds a counted reference on its parent, so the parent
       --  cannot be released while a child still names it.
@@ -559,7 +571,7 @@ package body Coroutines with SPARK_Mode => On is
       Pool (Slot).To_Clean   := False;
       Pool (Slot).Is_Started := False;
       By_Coro (Coro) := Slot;
-      Save_Occurrence (Pool (Slot).Exc, Null_Occurrence);
+      Save_Occurrence (Excs (Slot), Null_Occurrence);
    end Spawn_Slot;
 
    ------------
@@ -616,12 +628,12 @@ package body Coroutines with SPARK_Mode => On is
       if Previous_Slot in Valid_Slot and then Pool (Previous_Slot).To_Clean
       then
          Reset (Previous_Slot);
-         if not Is_Null_Occurrence (Pool (Previous_Slot).Exc) then
+         if not Is_Null_Occurrence (Excs (Previous_Slot)) then
             Reraise_And_Clean (Previous_Slot);
          end if;
       end if;
 
-      if not Is_Null_Occurrence (Pool (Cur).Exc) then
+      if not Is_Null_Occurrence (Excs (Cur)) then
          Reraise_And_Clean (Cur);
       end if;
    end Switch_Slot;
@@ -777,9 +789,17 @@ package body Coroutines with SPARK_Mode => On is
    procedure Reraise_And_Clean (Slot : Valid_Slot) is
       Saved_Exc : Exception_Occurrence;
    begin
-      Save_Occurrence (Saved_Exc, Pool (Slot).Exc);
-      Save_Occurrence (Pool (Slot).Exc, Null_Occurrence);
+      Save_Occurrence (Saved_Exc, Excs (Slot));
+      Save_Occurrence (Excs (Slot), Null_Occurrence);
       Reraise_Occurrence (Saved_Exc);
    end Reraise_And_Clean;
 
+begin
+   --  Exception_Occurrence is limited private, so SPARK cannot see that GNAT
+   --  default-initialises it to a null occurrence. Nulling them here is a
+   --  no-op at run time and turns an implicit assumption into an executed
+   --  fact, which is what lets Registry claim to be initialised.
+   for I in Valid_Slot loop
+      Save_Occurrence (Excs (I), Null_Occurrence);
+   end loop;
 end Coroutines;
