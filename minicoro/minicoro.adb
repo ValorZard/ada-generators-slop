@@ -349,6 +349,8 @@ is
       end if;
 
       if Coros (C).Coro_State /= Suspended then
+         --  Live code, and the only thing enforcing it: Resume carries no
+         --  precondition, by the reasoning in the spec.
          Res := Not_Suspended;
          return;
       end if;

@@ -151,9 +151,16 @@ is
 
    procedure Resume (C : Valid_Id; Res : out Result)
      with Global => (In_Out => (Pool, Current_State)),
-          Pre    => Status (C) = Suspended,
           Post   => (if Res = Success then Status (C) in Suspended | Dead);
    --  Transfer control into C. Returns when C yields or finishes.
+   --
+   --  Total, like Switch_To and unlike Yield: every call returns a defined
+   --  Result. C not being Suspended is reported as Not_Suspended rather than
+   --  forbidden by a precondition. That is deliberate -- the enumerator
+   --  exists to report exactly this, the only callers are outside SPARK, and
+   --  a precondition here would be neither verified (nothing in SPARK calls
+   --  Resume) nor checked (no .gpr in the tree passes -gnata), while making
+   --  the guard that does the real work look dead to the prover.
 
    procedure Yield (C : Valid_Id; Res : out Result)
      with Global => (In_Out => (Pool, Current_State)),

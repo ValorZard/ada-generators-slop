@@ -216,13 +216,13 @@ cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail \
   --pedantic --proof-warnings=on
 ```
 
-`Success: all checks proved (579 checks)` and **21 warnings**:
+`Success: all checks proved (579 checks)` and **20 warnings**:
 
 | Count | Kind                                    | Group |
 |-------|-----------------------------------------|-------|
 | 11    | `operator-reassociation`                | 2     |
 | 7     | `Code_Page` overlay family              | 3     |
-| 2     | `unreachable code`                      | 1, 4  |
+| 1     | `unreachable code`                      | 4     |
 | 1     | `representation-attribute-value`        | 5     |
 
 None of them has verification consequences any more.
@@ -278,11 +278,16 @@ afterwards except assign `Res` and return, and `Trampoline` — the fourth
 caller, which had not been analysed when the risk was written down — ends in
 its unreachable spin. Nothing downstream needed the facts that went away.
 
-`minicoro.adb:352` (`Res := Not_Suspended`) is separate and is **not a bug**:
-`Resume`'s precondition is `Status (C) = Suspended`, so the guard is dead for
-SPARK-proved callers. It stays — `Coroutines` is not SPARK and can violate
-that precondition. If the warning needs silencing, justify it in place rather
-than deleting the check.
+`minicoro.adb:352` (`Res := Not_Suspended`) used to be reported here too, and
+is now gone for a better reason than suppression. `Resume` had
+`Pre => Status (C) = Suspended`, which made the guard dead to the prover. That
+precondition was doing no work: nothing in SPARK calls `Resume` (`Coroutines`
+uses `Switch_To` and `Destroy`; the tests are not SPARK), and no `.gpr` in the
+tree passes `-gnata`, so it was neither verified nor checked at run time --
+while the guard it shadowed was the only thing actually stopping a caller from
+resuming a `Running` coroutine. The precondition is gone and `Resume` is now
+total, like `Switch_To`. `Yield` and `Destroy` keep theirs; they are not in
+the same position.
 
 ### 2. `operator-reassociation` — 11 warnings, cosmetic, deliberately deferred
 
@@ -354,7 +359,7 @@ Informational; the loops carry invariants and prove fine. Nothing to do.
 Family 1 is done. Family 2 is independent and can be skipped or done at
 leisure; families 3, 4 and 5 are tool limitations or deliberate trades, not
 work items. If you touch the lifecycle again, re-run the extended command
-above and confirm the count is still 21 with no `pragma Assume is always
+above and confirm the count is still 20 with no `pragma Assume is always
 False` among them — that warning reappearing is the signal that the re-entry
 model has drifted.
 
