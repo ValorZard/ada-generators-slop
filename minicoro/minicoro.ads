@@ -19,8 +19,6 @@
 --  Minicoro.Trampoline_Entry. See README.md for what is proved, what is
 --  assumed, and why.
 
-with System;
-
 package Minicoro with
   SPARK_Mode,
   Abstract_State => (Pool, Current_State),
@@ -108,9 +106,6 @@ is
      with Global => (Input => Pool),
           Post   => Free_Space'Result = Storage_Size (C) - Bytes_Stored (C);
 
-   function User_Data (C : Coroutine_Id) return System.Address
-     with Global => (Input => Pool);
-
    function Running_Coroutine return Coroutine_Id
      with Global => (Input => Current_State);
    --  The coroutine currently executing, or No_Coroutine on the main context.
@@ -128,7 +123,6 @@ is
       Func         : Entry_Point;
       Stack_Size   : Stack_Count   := Default_Stack_Size;
       Storage_Size : Storage_Count := Max_Storage;
-      User_Data    : System.Address := System.Null_Address;
       Res          : out Result)
      with Global => (In_Out => Pool),
           Post   =>

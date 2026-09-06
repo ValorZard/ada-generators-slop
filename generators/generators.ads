@@ -5,11 +5,16 @@ with Ada.Finalization;
 
 with Coroutines;
 
---  NOT SPARK. Generator and Generator_Internal extend
---  Ada.Finalization.Controlled, which GNATprove rejects outright, and this
---  package is built on Coroutines, which is out for the same reason plus
---  four more. Nothing here is individually exotic; the reference-counting
---  design is simply not expressible in the SPARK subset.
+--  NOT SPARK, unlike the two layers below it. Generator and
+--  Generator_Internal extend Ada.Finalization.Controlled, which GNATprove
+--  rejects outright ("not allowed in SPARK (due to controlled types)"), and
+--  the ref-counted handle graph is shared ownership, which SPARK's ownership
+--  model does not have.
+--
+--  Both are fixable, and Coroutines shows how: pool indices instead of
+--  pointers, and GNAT's Finalizable aspect instead of Controlled. Doing the
+--  same here is the obvious next step and has not been attempted -- see
+--  CLAUDE.md, "Not done".
 
 generic
    type T is private;

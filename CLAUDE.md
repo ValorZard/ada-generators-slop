@@ -15,18 +15,27 @@ A prototype for Ada generators/coroutines, in four layers, bottom up:
 |               | `Minicoro.FTAL`          | yes   | ghost register/stack typing model (all Ghost) |
 |               | `Minicoro.Contexts`      | yes*  | **private child**; trusted context switch   |
 |               | `Minicoro.Code_Page`     | yes   | W^X page from the OS                        |
-| `coroutines/` | `Coroutines`             | no    | ref-counted, GNAT-runtime-integrated wrapper |
+| `coroutines/` | `Coroutines`             | yes*  | ref-counted, GNAT-runtime-integrated wrapper |
 | `generators/` | `Generators`             | no    | generator API over `Coroutines`             |
 
-`yes*` means the unit is `SPARK_Mode => On` with named exceptions inside it.
-All of `minicoro/` is On except six places, each marked and justified where it
-sits — see "The six things that cannot be SPARK" below. `coroutines/` and
-`generators/` are `SPARK_Mode => Off` and cannot be otherwise: they are built
-on `Ada.Finalization.Controlled`, which GNATprove rejects outright.
+`yes*` means the unit is `SPARK_Mode => On` with named exceptions inside it,
+each marked and justified where it sits. Both proof runs are clean:
+`minicoro/` proves 574 checks and `coroutines/` 643 (that figure includes
+`minicoro`'s, since the project withs it), both with 2 justified and **0
+unproved**.
+
+`generators/` is the one layer still `SPARK_Mode => Off`, and only because
+nobody has done to it what was done to `Coroutines` — see "Not done".
 
 `minicoro/` replaced a thin binding to PCL (the old `pcl/` directory, deleted).
 The `generators/` layer was untouched by that swap — the change is confined to
 `Coroutines` and below.
+
+`Coroutines` was later rewritten to get it into SPARK. Its interface is
+unchanged, but underneath it is a pool of indices rather than a graph of
+ref-counted pointers, and it uses GNAT's `Finalizable` aspect rather than
+`Ada.Finalization.Controlled`. Read the header of `coroutines.ads` before
+touching it; the reasons are not guessable from the code.
 
 ## Toolchain
 
@@ -84,11 +93,17 @@ The two `minicoro` cases are self-checking rather than golden: they print
 export PATH="$HOME/.local/share/alire/releases/gnatprove_16.1.0_82528bef/bin:\
 $HOME/.local/share/alire/toolchains/gnat_native_16.1.0_9f74f58a/bin:\
 $HOME/.local/share/alire/toolchains/gprbuild_26.0.1_e3f27f25/bin:$PATH"
-cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail
+cd minicoro    && gnatprove -P minicoro.gpr    --level=2 -j4 --report=fail
+cd coroutines  && gnatprove -P coroutines.gpr  --level=2 -j4 --report=fail
 ```
 
-Expected: `Success: all checks proved (579 checks)` with **2 justified, 0
-unproved**. Takes roughly 10-20 minutes — run it in the background, do not
+Expected: `Success: all checks proved (574 checks)` for `minicoro` and
+`(643 checks)` for `coroutines`, each with **2 justified, 0 unproved**. The
+second figure includes the first: `coroutines.gpr` withs `minicoro.gpr`, so
+that run re-analyses everything and is the one to trust if you only run one.
+`generators/` has no proof run; it is `SPARK_Mode => Off`.
+
+Each run takes roughly 10-40 minutes — start it in the background and do not
 poll it. `--level=3` also passes; `--report=statistics` if you want per-check
 detail.
 
@@ -99,11 +114,13 @@ SPARK does and does not buy" below. Nothing else in the default run warns.
 
 `obj/gnatprove/gnatprove.out` holds the summary table; read lines 5-24.
 
-Do not run `gprbuild` and `gnatprove` on `minicoro/` at the same time — they
-share `obj/`. That includes `alr build` and `alr test`, which call `gprbuild`.
+Do not run `gprbuild` and `gnatprove` on the same directory at the same time —
+they share `obj/`. That includes `alr build` and `alr test`, which call
+`gprbuild`. Proving `coroutines/` reads `minicoro/`'s sources but writes only
+`coroutines/obj`, so those two proof runs can overlap with each other.
 
-There are two justifications, both written out with `pragma Annotate` at the
-site.
+There are two justifications, both in `minicoro/` and both written out with
+`pragma Annotate` at the site. `coroutines/` has none.
 
 `Minicoro.Transfer`: SPARK's anti-aliasing rule (RM 6.4.2) is syntactic and
 treats `Coros (From).Ctx` and `Coros (To).Ctx` as possibly the same object
@@ -119,11 +136,13 @@ type (its full view became visible when the private part of `Contexts` went
 and does not track reclamation across calls through an array element with a
 non-static index.
 
-## The six things that cannot be SPARK
+## What cannot be SPARK, and why
 
-Everything in `minicoro/` is `SPARK_Mode => On` except these, and each was
-confirmed against GNATprove rather than assumed. Do not "clean them up" by
-flipping the pragma: the list below is what the tool actually rejects.
+Each of these was confirmed against GNATprove rather than assumed. Do not
+"clean them up" by flipping the pragma: the list below is what the tool
+actually rejects.
+
+### In `minicoro/` — six, all machine-level
 
 1. **`Minicoro.Contexts.Machine`** (body only; the spec is On). Two
    `Unchecked_Conversion` instances GNATprove refuses — *to* an
@@ -153,6 +172,41 @@ The recurring hard errors behind those, for reference:
 - `access to subprogram with global effects is not allowed in SPARK`
 - `effectively volatile object not at library level [E0001]`
 
+### In `coroutines/` — six subprograms and one package, all language-level
+
+A different kind of list. Nothing here is about machine state; every item is
+a place where the published interface and the SPARK subset disagree.
+
+1. **`Create`, `Current_Coroutine`, `Main_Coroutine`** — `SPARK_Mode => Off`
+   on the *declarations*, not just the bodies. A SPARK function may not write
+   globals (`E0005`), and handing out a coroutine has to bump a reference
+   count. Marking only the body is not enough: GNATprove infers the global
+   and rejects the declaration. The slot bookkeeping is factored out into
+   `Claim_Slot`, which is analysed.
+2. **`Spawn`, `Switch`, `Kill`** — they raise, and they are primitives of a
+   tagged type. `aspect "Exceptional_Cases" on dispatching operation is not
+   yet supported`, so there is no way to declare what comes out of them.
+   `Coroutine` has to stay tagged because the whole codebase calls these in
+   prefix notation (`C.Spawn`). The work is in `Spawn_Slot`, `Switch_Slot`
+   and `Kill_Slot`, which are analysed and do carry `Exceptional_Cases`.
+3. **`Raw`** — the body only; its spec is SPARK so the rest of the package
+   can call it. Eight operations, four distinct rejections:
+   `instance of Unchecked_Deallocation with a general access type is not
+   allowed in SPARK` (`Delegate_Access` is `access all`);
+   `attribute "Address" outside an attribute definition clause` (the
+   secondary-stack overlay); `access to subprogram with global effects`
+   (`Coroutine_Wrapper'Access`); and
+   `choice parameter in handler is not allowed in SPARK`, which is what
+   forces `Capture_Abort` and `Run_Delegate` out — capturing an occurrence
+   needs `when E : others`, and SPARK has no way to name `E`.
+
+`Raw` also holds `Save_Sec_Stack`/`Restore_Sec_Stack`. Those are not
+*rejected* — they were moved because `System.Soft_Links` reaches the
+secondary stack through a variable of access-to-subprogram type, so each call
+is a dereference SPARK wants proved non-null and whose target's effects it
+cannot see. Grouping them with the rest of the runtime plumbing was cheaper
+and more honest than sprinkling null guards through `Switch_Slot`.
+
 `Minicoro.Trampoline` itself **is** SPARK now. It carries a precondition
 stating what the generated entry code owes it (Handle is the pool index
 `Create` encoded, the slot is live, its resumer is neither itself nor a
@@ -176,29 +230,34 @@ modified, could be IN`. It models `Write` as a no-op. The `[E0012]`
 `imprecise-address-specification` warning is the same limitation stated once.
 So `Code_Page` is analysed for its state machine, not for its effect.
 
-### Why `coroutines/` and `generators/` cannot be SPARK
+### How `Coroutines` got into SPARK
 
-Not a matter of effort. `Coroutine`, `Coroutine_Internal`, `Generator` and
-`Generator_Internal` all extend `Ada.Finalization.Controlled`, and GNATprove's
-answer to that is flat:
+Two things had to change, and neither was avoidable.
 
-```
-error: "Controlled" is not allowed in SPARK (due to controlled types)
-```
+**Controlled types are rejected outright** — `error: "Controlled" is not
+allowed in SPARK (due to controlled types)`. GNAT's `Finalizable` aspect does
+the same job and *is* analysed, so `Coroutine` now carries
+`Finalizable => (Adjust => Bump, Finalize => Drop)`. It needs `-gnatX`.
 
-Reference counting and stack release via `Initialize`/`Adjust`/`Finalize` is
-those two layers' design, so this is not fixable by annotation. Three more
-hard rejections sit in `coroutines.adb` on their own account:
-`Coroutine_Wrapper'Access` (global effects), `C'Address` (E0002), and
-`System.Address_To_Access_Conversions.To_Pointer`, which SPARK models as an
-allocating function returning an owning pointer.
+**Reference counting is shared ownership, which SPARK does not have.** Two
+handles onto one coroutine are two owning pointers to the same object, which
+is exactly what its ownership model forbids. So the handle became an index
+into a statically sized pool, as `Minicoro` did one layer down: copying a
+handle copies an integer and there is nothing to alias. That also deleted the
+old `C'Address` → `Minicoro.User_Data` →
+`System.Address_To_Access_Conversions.To_Pointer` round trip, which was three
+separate SPARK violations, and with it `Minicoro.User_Data` itself.
 
-Two things that are *not* the reason, contrary to expectation:
+Two things that are *not* obstacles, contrary to expectation:
 `Ada.Exceptions.Save_Occurrence`/`Reraise_Occurrence` are legal SPARK, and so
-is an `exception when others` handler. Both were checked in isolation.
+is an `exception when others` handler. Only a *choice parameter*
+(`when E : others`) is rejected. Both were checked in isolation.
 
-Both packages now carry an explicit `SPARK_Mode => Off` with the reason in a
-header comment, so the status is declared rather than merely defaulted.
+The visible costs are three, all recorded in `coroutines.ads`: a compile-time
+ceiling (`Max_Coroutines`), `Create` returning `Null_Coroutine` instead of
+raising when the pool is full (a SPARK function may not propagate), and
+`Delegate` being an abstract tagged type rather than an interface — see the
+GNAT bug under "Traps that cost time".
 
 ## Proof warnings: where this stands (2026-09-06)
 
@@ -216,7 +275,7 @@ cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail \
   --pedantic --proof-warnings=on
 ```
 
-`Success: all checks proved (579 checks)` and **20 warnings**:
+`Success: all checks proved (574 checks)` and **20 warnings**:
 
 | Count | Kind                                    | Group |
 |-------|-----------------------------------------|-------|
@@ -365,6 +424,44 @@ model has drifted.
 
 ## Traps that cost time
 
+**GNAT miscompiles `Unchecked_Deallocation` of an interface class-wide object
+with a `Finalizable` component.** This cost hours. Symptom:
+`free(): invalid size`, or a `Storage_Error` reported as
+"stack overflow or erroneous memory access", at a deallocation whose pointer
+and object are both demonstrably intact. Under valgrind it is
+`Detach_Object_From_Collection` reading a header 24 bytes before a block that
+never had one: the allocator emitted a plain block, the deallocation assumed
+a collection-attached one.
+
+Minimal reproduction, ~40 lines over three units, all with `-gnatX`:
+
+- unit A declares a `Finalizable` type and an **interface**, plus
+  `type P is access all Iface'Class` and an `Unchecked_Deallocation` on it;
+- unit B declares a type implementing that interface **with a `Finalizable`
+  component**;
+- unit C allocates one as `P`; A frees it.
+
+The workaround is to root the class-wide type at an ordinary tagged type:
+`Coroutines.Delegate` is `abstract tagged null record`, not `interface`, and
+that alone makes the corruption go away. If you ever change it back, the
+three tests that catch it are `test_resume_simple`, `test_foreign_kill` and
+`test_spawn_switch_kill`. Note that a plain run may still *pass* while
+corrupting the heap — check under valgrind, which reports it precisely.
+
+**`pragma Extensions_Allowed (On)` is not enough for clients.** It lets the
+unit that writes `Finalizable` compile, but a client compiled without
+`-gnatX` silently gets a different view of the type's finalization, and you
+get the mismatch above rather than an error. `-gnatX` must be on every unit
+that can see the type, which is why all six `.gpr` files carry it.
+
+**GNAT stops warning about unwritten formals when a type stops being
+controlled.** `test_secondary_stack` declares helpers taking
+`Delegate'Class` as `in out` and only reads them. That was silent while
+`Coroutine` was `Ada.Finalization.Controlled` and started failing the build
+under `-gnatwae` when it became a `Finalizable` record. The test source is
+deliberately unchanged; `coroutines/tests/tests.gpr` turns `-gnatwK` and
+`-gnatwU` off *for that one file*.
+
 **Ada in bash heredocs.** Tick attributes (`X'First`, `T'Access`) break
 `<<'EOF'` quoting — bash reports `unexpected EOF while looking for matching '`.
 Use the Write tool for Ada sources, or a Python script for surgical edits.
@@ -425,12 +522,25 @@ GNAT rejects an object filename that doesn't match the unit name.
 
 ## Design decisions worth not re-litigating
 
-**Coroutines are pool indices, not pointers.** `Minicoro` holds
+**Coroutines are pool indices, not pointers — at both layers.** `Minicoro`
+holds
 `Coros : array (Valid_Id) of Coroutine_Record` and names coroutines by index.
 This is the single decision that makes the lifecycle provable — no aliasing for
 SPARK's ownership model to police. Cost: a compile-time `Max_Coroutines`
 (64) and `Max_Storage` (1024 bytes/coroutine, static). Stacks are still
 heap-allocated and are not counted in that.
+
+`Coroutines` was later made to do the same thing for the same reason, and the
+reason is worth being precise about: ref counting *is* shared ownership, and
+SPARK's ownership model has only unique ownership. A `Coroutine` handle is
+now a `Slot_Id`, so copying one copies an integer and no two handles are
+aliased pointers. `Max_Coroutines` there is 128 and counts unspawned and dead
+coroutines too, since a slot is held for as long as any handle names it.
+
+A consequence worth knowing: the two layers have *separate* pools with
+separate limits, joined by `By_Coro : array (Minicoro.Valid_Id) of Slot_Id`.
+That array is what replaced the old address round trip, and it is the only
+thing tying the two id spaces together.
 
 **`Minicoro.Contexts` is a private child.** Its `Backend_State` is
 `Part_Of => Minicoro.Pool`. Without that, every operation in `Minicoro` would
@@ -466,9 +576,13 @@ hand-written byte table anywhere in `minicoro/` — the only byte table is
 Proved: all of `Machine_Code` (including `Resume_Point_Correct` and the
 displacement round trip), `Minicoro`'s absence of runtime errors, state guards
 and the storage invariant `Stored <= Cap` (a `Dynamic_Predicate` on
-`Coroutine_Record`), `Code_Page`'s allocate/write/seal state machine, and
-everything in `Contexts` but the five subprograms listed under "The six things
-that cannot be SPARK".
+`Coroutine_Record`), `Code_Page`'s allocate/write/seal state machine,
+everything in `Contexts` but the five subprograms listed under "What cannot be
+SPARK", and — since the rewrite — `Coroutines`' slot lifecycle: the reference
+counting, the parent chain, and the absence of runtime errors across
+`Claim_Slot`, `Spawn_Slot`, `Switch_Slot`, `Kill_Slot`, `Release` and `Reset`.
+That is the part where a ref-counting bug would live, which is why it was
+worth the rewrite.
 
 Assumed, each marked in the source with its reasoning:
 1. The generated assembly implements `Contexts.Switch`'s contract. SPARK has no
@@ -501,6 +615,14 @@ Assumed, each marked in the source with its reasoning:
 6. **`Code_Page.Write` actually copies bytes.** GNATprove models the overlay
    write as having no effect and says so; see "What `Code_Page` being SPARK
    does and does not buy".
+7. **`Coroutines.Create` does not retain or free its delegate twice.**
+   `Raw.Adopt_Delegate` moves a pointer SPARK sees only as observed. The
+   obligation is the one `Create`'s documentation already places on the
+   caller: ownership of `D` transfers, so the caller must not keep or free
+   it.
+8. **The GNAT secondary stack and soft links behave.** `Raw`'s
+   `Init_Sec_Stack`, `Save_Sec_Stack` and `Restore_Sec_Stack` call through
+   `System.Soft_Links`, whose effects SPARK cannot see.
 
 If you touch `Resume`/`Yield`/`Switch_To`/`Trampoline`, re-check that the
 assumptions still match what the counterpart routine actually restores. They
@@ -536,8 +658,13 @@ destroyed while the coroutine ran.
 ## Conventions
 
 - Ada 2022 (`-gnat2022`), LF endings, 79 columns, GNAT style. All six
-  `.gpr` files carry the same `("-gnat2022", "-gnatwae", "-gnatyg")`; keep
-  them in step.
+  `.gpr` files carry the same
+  `("-gnat2022", "-gnatwae", "-gnatyg", "-gnatX")`; keep them in step.
+  `-gnatX` is not optional and not confined to the unit that needs it: see
+  the `Extensions_Allowed` trap above. The one deliberate exception is the
+  per-file `Switches` for `test_secondary_stack.adb` in
+  `coroutines/tests/tests.gpr`, which adds `-gnatwK -gnatwU` so that the
+  test source can stay exactly as it was.
 - Copyright headers: existing files keep
   `Copyright (C) 2014-2022, Pierre-Marie de Rodat`; new files use
   `Copyright (C) 2026, ada-generators contributors`. All `Apache-2.0`.
@@ -560,9 +687,17 @@ destroyed while the coroutine ran.
   `Standard'Target_Name`.
 - Eleven `operator-reassociation` warnings remain under `--pedantic`. Purely
   cosmetic; see "Proof warnings", family 2.
-- `coroutines/` and `generators/` are `SPARK_Mode => Off` and staying that
-  way; putting them in SPARK means replacing `Ada.Finalization.Controlled`
-  ref-counting with something SPARK accepts, which is a rewrite of both
-  layers, not an annotation exercise.
+- `generators/` is still `SPARK_Mode => Off`. It is out for exactly the two
+  reasons `Coroutines` used to be — `Ada.Finalization.Controlled` and
+  ref-counted shared ownership — and `Coroutines` is now a worked example of
+  how to fix both. Expect the same shape: a pool of indices, the
+  `Finalizable` aspect, `Off` shims where a function has to write globals or
+  a dispatching operation has to raise. `Generator_Internal` also holds a
+  `Yield_Value : T` for a generic formal private type, which is new
+  territory.
+- `Coroutines` proves absence of runtime errors and its slot lifecycle, but
+  carries no *functional* postconditions — nothing states what `Switch` does
+  to the pool, only that it cannot go wrong. Contracts in the style of
+  `Minicoro.Resume`/`Yield` would be the next real strengthening.
 - The user pushes to their own fork
   (`https://github.com/ValorZard/ada-generators-slop.git`) themselves.

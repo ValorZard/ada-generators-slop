@@ -39,7 +39,8 @@ project Minicoro is
    end Naming;
 
    package Compiler is
-      for Default_Switches ("Ada") use ("-gnat2022", "-gnatwae", "-gnatyg");
+      for Default_Switches ("Ada") use
+        ("-gnat2022", "-gnatwae", "-gnatyg", "-gnatX");
    end Compiler;
 
    package Prove is

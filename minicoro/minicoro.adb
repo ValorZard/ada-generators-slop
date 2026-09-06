@@ -30,7 +30,6 @@ is
       In_Use     : Boolean        := False;
       Func       : Entry_Point    := null;
       Prev       : Coroutine_Id   := No_Coroutine;
-      Data       : System.Address := System.Null_Address;
 
       Ctx   : Contexts.Context;
       Stack : Contexts.Stack_Handle;
@@ -145,9 +144,6 @@ is
    function Free_Space (C : Coroutine_Id) return Storage_Count is
      (Storage_Size (C) - Bytes_Stored (C));
 
-   function User_Data (C : Coroutine_Id) return System.Address is
-     (if C = No_Coroutine then System.Null_Address else Coros (C).Data);
-
    function Running_Coroutine return Coroutine_Id is (Current);
 
    function Is_Allocated (C : Coroutine_Id) return Boolean is
@@ -248,7 +244,6 @@ is
       Func         : Entry_Point;
       Stack_Size   : Stack_Count    := Default_Stack_Size;
       Storage_Size : Storage_Count  := Max_Storage;
-      User_Data    : System.Address := System.Null_Address;
       Res          : out Result)
    is
       Slot : Coroutine_Id := No_Coroutine;
@@ -301,7 +296,6 @@ is
          Handle => Handle_Of (Slot));
 
       Coros (Slot).Func       := Func;
-      Coros (Slot).Data       := User_Data;
       Coros (Slot).Prev       := No_Coroutine;
       Coros (Slot).Stored     := 0;
       Coros (Slot).Cap        := Storage_Size;

@@ -79,6 +79,9 @@ Minicoro.Machine_Code   SPARK   x86-64 instruction encoder + switch listing
 Minicoro.FTAL           SPARK   ghost register/stack typing model  (all Ghost)
 Minicoro.Contexts       SPARK   except the switch itself and its plumbing
 Minicoro.Code_Page      SPARK   W^X page from the OS
+Coroutines              SPARK   except where the published API and the
+                                SPARK subset disagree
+Generators              --      not yet converted
 ```
 
 All of `minicoro/` is `SPARK_Mode => On` except six subprograms, each marked
@@ -87,10 +90,23 @@ code-page address into a callable switch routine and a coroutine body into a
 machine word, the indirect call itself, `Make_Context`'s overlay write,
 `Adopt_Current`'s volatile stack anchor, `Allocate_Stack`'s `'Address` and
 `Storage_Error` handler, and the `'Access` taken in `Trampoline_Entry`. Those
-are what GNATprove rejects outright — not choices. The layers above
-(`coroutines/`, `generators/`) are `SPARK_Mode => Off` and cannot be
-otherwise: they are built on `Ada.Finalization.Controlled`, which GNATprove
-rejects as such.
+are what GNATprove rejects outright — not choices.
+
+`Coroutines` is SPARK too, which took a rewrite rather than annotations.
+Reference counting *is* shared ownership and SPARK's ownership model has only
+the unique kind, so the handle became an index into a pool exactly as
+`Minicoro`'s is; and `Ada.Finalization.Controlled` is rejected outright, so
+finalization uses GNAT's `Finalizable` aspect instead. The interface did not
+change. What stayed outside SPARK there is a different kind of thing from
+`minicoro`'s — not machine state but places where the published API and the
+subset disagree: a SPARK function may not write globals, yet `Create` must
+count a reference; and `Exceptional_Cases` is not accepted on a dispatching
+operation, yet `Spawn`/`Switch`/`Kill` raise and must stay primitives of a
+tagged type for the prefix notation the codebase uses.
+
+`Generators` is the one layer still outside. It is out for the two reasons
+`Coroutines` used to be, and `Coroutines` is now the worked example of how to
+fix them.
 
 At elaboration, `Minicoro.Machine_Code` assembles the switch routine from
 typed instruction encoders; `Minicoro.Code_Page` writes those bytes into a page
@@ -143,11 +159,14 @@ What is proved and what is assumed
 ----------------------------------
 
 Being precise about this matters more than the headline number, which is
-`Success: all checks proved (579 checks)` — 326 run-time checks, 100
-functional contracts, 19 assertions, 65 termination checks, and the flow
-analysis, with two justifications (see below).
+`Success: all checks proved` — 574 checks for `minicoro` and 643 for
+`coroutines`, the latter including the former since its project withs it.
+That is 371 run-time checks, 107 functional contracts, 19 assertions, 68
+termination checks and the flow analysis, with two justifications (see
+below) and nothing unproved.
 
-**Proved** (GNATprove, `gnatprove -P minicoro.gpr`):
+**Proved** (GNATprove, `gnatprove -P coroutines.gpr`, which covers both
+layers):
 
 * `Minicoro.Machine_Code` in full — absence of runtime errors, termination,
   and the functional contracts, including `Resume_Point_Correct` and the
@@ -164,8 +183,14 @@ analysis, with two justifications (see below).
   `Import` overlay at a computed address, which GNATprove models as having no
   effect (see assumption 6).
 * `Minicoro.Contexts` — everything but the five subprograms named above.
+* `Coroutines` — the slot lifecycle: reference counting, the parent chain,
+  and absence of runtime errors across `Claim_Slot`, `Spawn_Slot`,
+  `Switch_Slot`, `Kill_Slot`, `Release` and `Reset`. That is where a
+  ref-counting bug would live, which is what made the rewrite worth doing.
+  There are no functional postconditions there yet: it is proved not to go
+  wrong, not proved to do anything in particular.
 
-**Assumed.** Six things, each marked in the source:
+**Assumed.** Eight things, each marked in the source:
 
 1. **The generated assembly implements `Contexts.Switch`.** SPARK has no
    semantics for machine instructions, so `Switch`'s postcondition is
@@ -201,6 +226,13 @@ analysis, with two justifications (see below).
    `unused assignment`. It believes `Write` is a no-op. The bytes it writes
    are checked instead by `test_golden`, which compares the generated listing
    against a byte-for-byte oracle, and by `test_coro`, which runs it.
+7. **`Coroutines.Create` does not retain or free its delegate twice.** The
+   pointer is moved into the pool by a trusted helper, because SPARK sees
+   `Create`'s parameter only as observed. This is the obligation `Create`'s
+   documentation already places on its caller: ownership transfers.
+8. **The GNAT secondary stack and soft links behave.** Saving, restoring and
+   initialising a coroutine's secondary stack goes through
+   `System.Soft_Links`, whose effects SPARK cannot see.
 
 The **justified** checks are two, both written out with `pragma Annotate` at
 the site and both showing up in GNATprove's report rather than being silently

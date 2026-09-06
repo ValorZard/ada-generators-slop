@@ -1,198 +1,500 @@
 --  Copyright (C) 2014-2022, Pierre-Marie de Rodat
+--  Copyright (C) 2026, ada-generators contributors
 --  SPDX-License-Identifier: Apache-2.0
+
+--  SPARK, except for the nested package Raw and the secondary-stack helper.
+--  See the head of coroutines.ads for why the pointer graph became a pool.
+--
+--  What is left outside SPARK here is the same shape as Minicoro's trusted
+--  base: taking 'Access of a subprogram that touches globals, and adopting a
+--  pointer whose ownership the caller has promised to give up. Both are named
+--  and justified where they sit.
 
 with Ada.Exceptions; use Ada.Exceptions;
 with Ada.Exceptions.Is_Null_Occurrence;
-with Ada.Unchecked_Conversion;
 with Ada.Unchecked_Deallocation;
 
-with System; use System;
-with System.Address_To_Access_Conversions;
+with System;
+
+with Minicoro;
 
 pragma Warnings (Off);
 with System.Parameters;
+with System.Secondary_Stack;
 with System.Soft_Links;
 pragma Warnings (On);
 
---  NOT SPARK. Beyond the controlled types named in the spec, this body uses
---  four constructs GNATprove rejects outright:
---
---    * Coroutine_Wrapper'Access -- "access to subprogram with global effects
---      is not allowed in SPARK". The wrapper is the landing pad for a new
---      coroutine and necessarily touches Previous_Coroutine.
---    * System.Address_To_Access_Conversions.To_Pointer, to recover the
---      Coroutine_Internal from the handle Minicoro carried across the switch
---      -- SPARK models it as an allocating function returning an owning
---      pointer, which is the wrong ownership story entirely.
---    * C'Address, to hand that handle over in the first place -- 'Address
---      outside an attribute definition clause is not in SPARK.
---    * Unchecked_Conversion from System.Address to an access-to-tagged type,
---      in Get_Coroutine.
---
---  Save_Occurrence and Reraise_Occurrence are, perhaps surprisingly, legal
---  SPARK; they are not why this package is out.
-
-package body Coroutines with SPARK_Mode => Off is
+package body Coroutines with SPARK_Mode => On is
 
    use type System.Secondary_Stack.SS_Stack_Ptr;
    use type Minicoro.Coroutine_Id;
+   use type Minicoro.Entry_Point;
    use type Minicoro.Result;
 
    package SSL renames System.Soft_Links;
 
-   function Get_Coroutine (C : Coroutine_Internal_Access) return Coroutine;
-
-   --------------------
-   -- Main coroutine --
-   --------------------
-
-   Main_Coroutine_Internal : aliased Coroutine_Internal :=
-     (Ada.Finalization.Limited_Controlled with
-      D          => null,
-      Ref_Count  => 1,
-      Parent     => (Ada.Finalization.Controlled with Coroutine => null),
-      Coro       => Minicoro.No_Coroutine,
-      Sec_Stack  => null,
-      Is_Main    => True,
-      Is_Started => True,
-      To_Clean   => False,
-      Exc        => <>);
-   Previous_Coroutine : Coroutine_Internal_Access :=
-     Main_Coroutine_Internal'Access;
-
    Abort_Coroutine : exception;
-   --  Users should not be able to stop coroutine abortion. Use
-   --  Standard'Abort_Signal instead???
+   --  Users should not be able to stop coroutine abortion.
+
+   ----------------
+   -- The pool --
+   ----------------
+
+   type Coroutine_Record is limited record
+      Ref_Count  : Natural := 0;
+      --  Number of Coroutine handles naming this slot. Once it reaches 0 the
+      --  slot is released.
+
+      In_Use     : Boolean := False;
+      --  Whether this slot holds a coroutine at all. A released slot reads as
+      --  not in use and every observer below treats it as dead.
+
+      D          : Delegate_Access := null;
+      --  User code, owned by this slot and freed with it.
+
+      Parent     : Slot_Id := No_Slot;
+      --  Slot that created this one. Used to resume execution after
+      --  completion. Counted: Create bumps it, Release drops it.
+
+      Coro       : Minicoro.Coroutine_Id := Minicoro.No_Coroutine;
+      --  Backing coroutine in the Minicoro pool, or No_Coroutine when this
+      --  one is not spawned. The main coroutine is always No_Coroutine: that
+      --  id names the thread's own context.
+
+      Sec_Stack  : System.Secondary_Stack.SS_Stack_Ptr := null;
+      --  Saved coroutine-specific secondary stack.
+
+      Is_Main    : Boolean := False;
+      Is_Started : Boolean := False;
+      To_Clean   : Boolean := False;
+
+      Exc        : Exception_Occurrence;
+      --  When assigned a non-null exception occurrence, the Switch primitive
+      --  must re-raise it when resuming execution.
+   end record;
+
+   type Pool_Array is array (Valid_Slot) of Coroutine_Record;
+
+   Pool : Pool_Array;
+
+   By_Coro : array (Minicoro.Valid_Id) of Slot_Id := [others => No_Slot];
+   --  Which slot backs each live Minicoro coroutine. This replaces the old
+   --  round trip, which stashed a Coroutine_Internal'Address in a Minicoro
+   --  User_Data field and unchecked-converted it back. Minicoro already names
+   --  the running coroutine by index, so an array indexed by that is all it
+   --  takes, and no address is ever formed -- which is why that field, and
+   --  the observer that read it, are gone from Minicoro entirely.
+
+   Previous_Slot : Slot_Id := Main_Slot;
+
+   Booted : Boolean := False;
+   --  Whether Main_Slot has been claimed. Done lazily rather than at
+   --  elaboration so that nothing here depends on elaboration order.
+
+   ---------
+   -- Raw --
+   ---------
+
+   --  TRUSTED. The two things SPARK will not do, in one place.
+
+   package Raw with SPARK_Mode => On is
+
+      procedure Adopt_Delegate (Slot : Valid_Slot; D : Delegate_Access);
+      --  Store D as the slot's delegate, taking ownership.
+      --
+      --  Create takes D by mode `in`, so SPARK sees it as observed and
+      --  refuses to let it be moved into the pool. The mode is forced: Create
+      --  is a function, SPARK forbids `in out` parameters on functions, and
+      --  the published interface has it returning a Coroutine used directly
+      --  to initialise a constant. Changing that would break every caller.
+      --
+      --  The obligation this shifts onto the caller of Create is the one its
+      --  documentation already states: ownership of D is transferred, so the
+      --  caller must not retain or free it.
+
+      function Wrapper_Entry return Minicoro.Entry_Point
+        with Post => Wrapper_Entry'Result /= null;
+      --  Coroutine_Wrapper'Access. SPARK rejects access-to-subprogram values
+      --  whose designated subprogram has global effects, and the landing pad
+      --  for a new coroutine necessarily has them. Same wrapper trick as
+      --  Minicoro.Trampoline_Entry.
+
+      procedure Init_Sec_Stack (Slot : Valid_Slot);
+      --  Give the slot a secondary stack. Outside SPARK because the static
+      --  case overlays an object on Sec_Stack'Address, and 'Address outside
+      --  an attribute definition clause is not in SPARK.
+
+      procedure Free_Delegate (Slot : Valid_Slot);
+      --  Release the slot's delegate. Delegate_Access is a general access
+      --  type (access all), and SPARK does not allow Unchecked_Deallocation
+      --  of one -- it has no ownership model for pointers that may designate
+      --  something other than the heap.
+
+      procedure Capture_Abort (Slot : Valid_Slot);
+      --  Park an Abort_Coroutine occurrence in the slot, for Switch_Slot to
+      --  re-raise inside it. Outside SPARK because capturing an occurrence
+      --  needs a choice parameter (`when E : ...`), which SPARK rejects.
+
+      procedure Run_Delegate (Slot : Valid_Slot; To_Previous : out Boolean);
+      procedure Save_Sec_Stack (Slot : Valid_Slot);
+      procedure Restore_Sec_Stack (Slot : Valid_Slot);
+      --  Park and reinstate the running secondary stack. System.Soft_Links
+      --  reaches it through a variable of access-to-subprogram type, so a
+      --  call is a dereference SPARK wants proved non-null, and the target's
+      --  effects are invisible to it. Both facts are about the runtime's
+      --  internals rather than about this package, so they live here.
+      --  Run the slot's delegate and absorb whatever escapes it: a kill
+      --  becomes To_Previous, anything else is parked in the slot to be
+      --  re-raised in whoever resumes next. Outside SPARK for the same
+      --  choice-parameter reason.
+      --  Give the slot a secondary stack. Outside SPARK because the static
+      --  case overlays an object on Sec_Stack'Address, and 'Address outside
+      --  an attribute definition clause is not in SPARK.
+
+   end Raw;
 
    procedure Coroutine_Wrapper (Self : Minicoro.Valid_Id)
      with Convention => C;
-   --  Wrapper for coroutines execution: landing pad, catch exceptions, manage
-   --  state finalization.
+   --  Landing pad: run the delegate, catch what escapes it, then hand control
+   --  on. Never returns normally.
 
-   procedure Reraise_And_Clean (Exc : in out Exception_Occurrence);
-   --  Re-raise Exc while leaving Exc as a null occurrence
+   procedure Reraise_And_Clean (Slot : Valid_Slot)
+     with Exceptional_Cases => (others => True);
+   --  Re-raise the slot's saved occurrence, leaving it null.
 
-   procedure Reset (C : in out Coroutine_Internal);
-   --  Assuming that C is not running anymore, free associated resources and
+   procedure Reset (Slot : Valid_Slot);
+   --  Assuming the slot is not running anymore, free associated resources and
    --  reset flags.
 
-   function Current_Coroutine_Internal return Coroutine_Internal_Access;
+   procedure Release (Slot : Valid_Slot)
+     with Exceptional_Cases => (others => True);
+   --  Last handle gone: kill if needed, free the delegate, clear the slot.
 
-   -------------------
-   -- Get_Coroutine --
-   -------------------
+   procedure Ensure_Booted;
+   function Current_Slot return Valid_Slot;
+   function Alive_Slot (Slot : Slot_Id) return Boolean;
+   procedure Switch_Slot (Slot : Valid_Slot)
+     with Exceptional_Cases => (others => True);
+   procedure Kill_Slot (Slot : Valid_Slot)
+     with Exceptional_Cases => (others => True);
+   procedure Spawn_Slot
+     (Slot       : Valid_Slot;
+      Stack_Size : System.Storage_Elements.Storage_Offset)
+     with Exceptional_Cases => (Coroutine_Error => True);
 
-   function Get_Coroutine (C : Coroutine_Internal_Access) return Coroutine is
+   ---------
+   -- Raw --
+   ---------
+
+   package body Raw with SPARK_Mode => Off is
+
+      procedure Adopt_Delegate (Slot : Valid_Slot; D : Delegate_Access) is
+      begin
+         Pool (Slot).D := D;
+      end Adopt_Delegate;
+
+      function Wrapper_Entry return Minicoro.Entry_Point is
+      begin
+         return Coroutine_Wrapper'Access;
+      end Wrapper_Entry;
+
+      procedure Init_Sec_Stack (Slot : Valid_Slot) is
+      begin
+         if System.Parameters.Sec_Stack_Dynamic then
+            Pool (Slot).Sec_Stack := null;
+         else
+            declare
+               Sec_Stack : System.Address
+                 with Import, Address => Pool (Slot).Sec_Stack'Address;
+            begin
+               System.Secondary_Stack.SS_Allocate
+                 (Sec_Stack,
+                  System.Storage_Elements.Storage_Count
+                    (System.Parameters.Runtime_Default_Sec_Stack_Size));
+            end;
+         end if;
+         System.Secondary_Stack.SS_Init (Pool (Slot).Sec_Stack);
+         SSL.Set_Sec_Stack (Pool (Slot).Sec_Stack);
+      end Init_Sec_Stack;
+
+      procedure Free_Delegate (Slot : Valid_Slot) is
+         procedure Free is new Ada.Unchecked_Deallocation
+           (Delegate'Class, Delegate_Access);
+      begin
+         Free (Pool (Slot).D);
+      end Free_Delegate;
+
+      procedure Capture_Abort (Slot : Valid_Slot) is
+      begin
+         raise Abort_Coroutine;
+      exception
+         when Exc : Abort_Coroutine =>
+            Save_Occurrence (Pool (Slot).Exc, Exc);
+      end Capture_Abort;
+
+      procedure Save_Sec_Stack (Slot : Valid_Slot) is
+      begin
+         Pool (Slot).Sec_Stack := SSL.Get_Sec_Stack.all;
+      end Save_Sec_Stack;
+
+      procedure Restore_Sec_Stack (Slot : Valid_Slot) is
+      begin
+         SSL.Set_Sec_Stack (Pool (Slot).Sec_Stack);
+      end Restore_Sec_Stack;
+
+      procedure Run_Delegate
+        (Slot : Valid_Slot; To_Previous : out Boolean) is
+      begin
+         To_Previous := False;
+         if Pool (Slot).D /= null then
+            Pool (Slot).D.all.Run;
+         end if;
+      exception
+         when Abort_Coroutine =>
+            --  Kill resumes execution in the coroutine that invoked it.
+            To_Previous := True;
+
+         when Exc : others =>
+            Save_Occurrence (Pool (Slot).Exc, Exc);
+      end Run_Delegate;
+
+   end Raw;
+
+   --------------------
+   -- Ensure_Booted --
+   --------------------
+
+   procedure Ensure_Booted is
    begin
-      C.Ref_Count := C.Ref_Count + 1;
-      return (Ada.Finalization.Controlled with
-                Coroutine => C);
-   end Get_Coroutine;
+      if Booted then
+         return;
+      end if;
+      Pool (Main_Slot).Ref_Count  := 1;
+      Pool (Main_Slot).In_Use     := True;
+      Pool (Main_Slot).Is_Main    := True;
+      Pool (Main_Slot).Is_Started := True;
+      Pool (Main_Slot).Parent     := No_Slot;
+      Previous_Slot := Main_Slot;
+      Booted := True;
+   end Ensure_Booted;
 
-   --------------------------------
-   -- Current_Coroutine_Internal --
-   --------------------------------
+   ------------------
+   -- Current_Slot --
+   ------------------
 
-   function Current_Coroutine_Internal return Coroutine_Internal_Access is
+   function Current_Slot return Valid_Slot is
       Running : constant Minicoro.Coroutine_Id := Minicoro.Running_Coroutine;
-      function Convert is new Ada.Unchecked_Conversion
-        (System.Address, Coroutine_Internal_Access);
    begin
       --  Minicoro names the thread's own context No_Coroutine, which is
       --  exactly this package's main coroutine.
       if Running = Minicoro.No_Coroutine then
-         return Main_Coroutine_Internal'Access;
+         return Main_Slot;
+      elsif By_Coro (Running) in Valid_Slot then
+         return By_Coro (Running);
       else
-         return Convert (Minicoro.User_Data (Running));
+         return Main_Slot;
       end if;
-   end Current_Coroutine_Internal;
+   end Current_Slot;
+
+   ----------------
+   -- Alive_Slot --
+   ----------------
+
+   function Alive_Slot (Slot : Slot_Id) return Boolean is
+     (Slot in Valid_Slot
+        and then Pool (Slot).In_Use
+        and then (Pool (Slot).Is_Main
+                  or else Pool (Slot).Coro /= Minicoro.No_Coroutine));
+   --  The main coroutine is always alive: it is the thread itself, and it has
+   --  no pool slot in Minicoro to hold.
+
+   ----------
+   -- Bump --
+   ----------
+
+   procedure Bump (C : in out Coroutine) is
+   begin
+      if C.Slot in Valid_Slot
+        and then Pool (C.Slot).Ref_Count < Natural'Last
+      then
+         Pool (C.Slot).Ref_Count := Pool (C.Slot).Ref_Count + 1;
+      end if;
+   end Bump;
+
+   ----------
+   -- Drop --
+   ----------
+
+   procedure Drop (C : in out Coroutine) is
+      Slot : constant Slot_Id := C.Slot;
+   begin
+      --  Clear the handle before doing anything else. Releasing a slot can
+      --  run user finalization, which may look at this very handle; and a
+      --  reference loop reaches here with the count already at zero, which
+      --  means someone up the stack is already releasing this slot.
+      C.Slot := No_Slot;
+
+      if Slot not in Valid_Slot or else Pool (Slot).Ref_Count = 0 then
+         return;
+      end if;
+
+      Pool (Slot).Ref_Count := Pool (Slot).Ref_Count - 1;
+
+      if Pool (Slot).Ref_Count = 0 and then Slot /= Main_Slot then
+         Release (Slot);
+      end if;
+   exception
+      when others =>
+         --  A finalizer must not propagate. Release can reach Kill_Slot,
+         --  which switches into the coroutine being torn down and can come
+         --  back carrying whatever that coroutine died of; letting it out
+         --  here would turn an orderly scope exit into Program_Error and
+         --  lose the rest of the finalization. Dropping a reference is
+         --  best-effort by nature, so the exception stops here.
+         null;
+   end Drop;
+
+   -------------
+   -- Release --
+   -------------
+
+   procedure Release (Slot : Valid_Slot) is
+      Parent : constant Slot_Id := Pool (Slot).Parent;
+   begin
+      if Alive_Slot (Slot) then
+         Kill_Slot (Slot);
+      end if;
+
+      Raw.Free_Delegate (Slot);
+
+      Pool (Slot).In_Use     := False;
+      Pool (Slot).Parent     := No_Slot;
+      Pool (Slot).Is_Main    := False;
+      Pool (Slot).Is_Started := False;
+      Pool (Slot).To_Clean   := False;
+      Pool (Slot).Coro       := Minicoro.No_Coroutine;
+      Save_Occurrence (Pool (Slot).Exc, Null_Occurrence);
+
+      --  Drop the counted reference this slot held on its parent. Done last,
+      --  and iteratively rather than by recursion, so that a long ancestor
+      --  chain cannot recurse arbitrarily deep.
+      if Parent in Valid_Slot and then Pool (Parent).Ref_Count > 0 then
+         Pool (Parent).Ref_Count := Pool (Parent).Ref_Count - 1;
+      end if;
+   end Release;
+
+   -----------
+   -- Reset --
+   -----------
+
+   procedure Reset (Slot : Valid_Slot) is
+      Res : Minicoro.Result;
+   begin
+      if Pool (Slot).Coro /= Minicoro.No_Coroutine then
+         By_Coro (Pool (Slot).Coro) := No_Slot;
+
+         --  Destroy is only legal on a coroutine that is not active, which is
+         --  the only state one can be in by the time we clean up after it.
+         --  Testing rather than asserting keeps the guarantee local: nothing
+         --  in Minicoro's contract promises Success, so Res is deliberately
+         --  not checked either -- this is best-effort teardown.
+         if Minicoro.Status (Pool (Slot).Coro) in
+              Minicoro.Dead | Minicoro.Suspended
+         then
+            Minicoro.Destroy (Pool (Slot).Coro, Res);
+         end if;
+         Pool (Slot).Coro := Minicoro.No_Coroutine;
+      end if;
+
+      if Pool (Slot).Sec_Stack /= null then
+         System.Secondary_Stack.SS_Free (Pool (Slot).Sec_Stack);
+      end if;
+
+      Pool (Slot).Is_Started := False;
+      Pool (Slot).To_Clean   := False;
+   end Reset;
+
+   ------------
+   -- Create --
+   ------------
+
+   procedure Claim_Slot (Slot : out Slot_Id);
+   --  Everything Create does apart from adopting the delegate. Split out so
+   --  that the part which can be analysed is. No explicit Global: it would
+   --  have to name Minicoro.Current_State, which Current_Slot reads through
+   --  Minicoro.Running_Coroutine, and inference gets it right.
+
+   procedure Claim_Slot (Slot : out Slot_Id) is
+      Parent : Valid_Slot;
+   begin
+      Slot := No_Slot;
+      Ensure_Booted;
+      Parent := Current_Slot;
+
+      for I in Valid_Slot loop
+         if not Pool (I).In_Use then
+            Slot := I;
+            exit;
+         end if;
+      end loop;
+
+      if Slot not in Valid_Slot then
+         --  Pool exhausted. A SPARK function may not propagate an exception
+         --  -- Exceptional_Cases cannot be applied to one -- so this reports
+         --  the failure the way the type already provides for, by handing
+         --  back an uninitialized coroutine. Spawn, Switch and Kill all
+         --  reject one of those with Coroutine_Error, so the error still
+         --  surfaces, at first use rather than at construction.
+         return;
+      end if;
+
+      Pool (Slot).Ref_Count  := 1;
+      Pool (Slot).In_Use     := True;
+      Pool (Slot).Parent     := Parent;
+      Pool (Slot).Coro       := Minicoro.No_Coroutine;
+      Pool (Slot).Sec_Stack  := null;
+      Pool (Slot).Is_Main    := False;
+      Pool (Slot).Is_Started := False;
+      Pool (Slot).To_Clean   := False;
+      Save_Occurrence (Pool (Slot).Exc, Null_Occurrence);
+
+      --  The new slot holds a counted reference on its parent, so the parent
+      --  cannot be released while a child still names it.
+      if Pool (Parent).Ref_Count < Natural'Last then
+         Pool (Parent).Ref_Count := Pool (Parent).Ref_Count + 1;
+      end if;
+
+   end Claim_Slot;
+
+   function Create (D : Delegate_Access) return Coroutine is
+      pragma SPARK_Mode (Off);
+      --  Off for two reasons, both structural. A SPARK function may not
+      --  write globals, and this one must bump a reference count; and D
+      --  arrives as a constant view of an access-to-variable, which SPARK
+      --  will not let us hand to Raw.Adopt_Delegate. Everything above the
+      --  delegate hand-off is in Claim_Slot, which is analysed.
+      Slot : Slot_Id;
+   begin
+      Claim_Slot (Slot);
+      if Slot not in Valid_Slot then
+         return Null_Coroutine;
+      end if;
+      Raw.Adopt_Delegate (Slot, D);
+      return (Slot => Slot);
+   end Create;
 
    ---------
    -- "=" --
    ---------
 
    overriding function "=" (Left, Right : Coroutine) return Boolean is
-   begin
-      return Left.Coroutine = Right.Coroutine;
-   end "=";
-
-   ----------------
-   -- Initialize --
-   ----------------
-
-   overriding procedure Initialize (C : in out Coroutine) is
-   begin
-      C.Coroutine := null;
-   end Initialize;
-
-   ------------
-   -- Adjust --
-   ------------
-
-   overriding procedure Adjust (C : in out Coroutine) is
-   begin
-      if C.Coroutine /= null then
-         C.Coroutine.Ref_Count := C.Coroutine.Ref_Count + 1;
-      end if;
-   end Adjust;
-
-   --------------
-   -- Finalize --
-   --------------
-
-   overriding procedure Finalize (C : in out Coroutine) is
-      procedure Free is new Ada.Unchecked_Deallocation
-        (Coroutine_Internal, Coroutine_Internal_Access);
-   begin
-      --  There is nothing to do if there is no referenced coroutine. The
-      --  reference count can already be set to zero when finalization of a
-      --  loop of coroutine references occurs: in such case, one caller is
-      --  already finalizing this one, so there is nothing to do.
-
-      if C.Coroutine = null or else C.Coroutine.Ref_Count = 0 then
-         return;
-      end if;
-
-      C.Coroutine.Ref_Count := C.Coroutine.Ref_Count - 1;
-      if C.Coroutine /= Main_Coroutine_Internal'Access
-         and then C.Coroutine.Ref_Count = 0
-      then
-         --  Disposing the coroutine internal structure may in turn dispose the
-         --  stack of the coroutine... which may be the place where C used to
-         --  lie on! To avoid any issue, get a local access to the internal
-         --  structure first, clear C and only then dispose the structure.
-
-         declare
-            C_Int : Coroutine_Internal_Access;
-         begin
-            C_Int := C.Coroutine;
-            C.Coroutine := null;
-            Free (C_Int);
-         end;
-      end if;
-   end Finalize;
-
-   ------------
-   -- Create --
-   ------------
-
-   function Create (D : Delegate_Access) return Coroutine is
-      pragma Assert (D /= null);
-
-      C_Int : constant Coroutine_Internal_Access := new Coroutine_Internal (D);
-   begin
-      C_Int.Parent := Current_Coroutine;
-      return Get_Coroutine (C_Int);
-   end Create;
+     (Left.Slot = Right.Slot);
 
    -----------
    -- Alive --
    -----------
 
-   function Alive (C : Coroutine) return Boolean is
-   begin
-      return C.Coroutine.Alive;
-   end Alive;
+   function Alive (C : Coroutine) return Boolean is (Alive_Slot (C.Slot));
 
    -----------
    -- Spawn --
@@ -200,213 +502,187 @@ package body Coroutines with SPARK_Mode => Off is
 
    procedure Spawn
      (C          : Coroutine;
-      Stack_Size : System.Storage_Elements.Storage_Offset := 2**16) is
+      Stack_Size : System.Storage_Elements.Storage_Offset := 2**16)
+   is
+      pragma SPARK_Mode (Off);
+      --  Off because it raises and it is a primitive of a tagged type: SPARK
+      --  does not yet accept Exceptional_Cases on a dispatching operation, so
+      --  there is no way to declare what comes out. The work is in
+      --  Spawn_Slot, which is analysed.
    begin
-      C.Coroutine.Spawn (Stack_Size);
+      if C.Slot not in Valid_Slot then
+         raise Coroutine_Error with "uninitialized coroutine";
+      end if;
+      Spawn_Slot (C.Slot, Stack_Size);
    end Spawn;
+
+   ----------------
+   -- Spawn_Slot --
+   ----------------
+
+   procedure Spawn_Slot
+     (Slot       : Valid_Slot;
+      Stack_Size : System.Storage_Elements.Storage_Offset)
+   is
+      Coro : Minicoro.Coroutine_Id;
+      Res  : Minicoro.Result;
+   begin
+      Ensure_Booted;
+
+      if Alive_Slot (Slot) then
+         raise Coroutine_Error with "Coroutine already spawed";
+      end if;
+
+      --  Storage_Offset is signed and far wider than Stack_Count, so the
+      --  conversion below needs both ends pinned down. Minicoro raises the
+      --  figure to Min_Stack_Size itself, so anything positive is acceptable
+      --  here; what is not acceptable is a negative or absurd request.
+      if Stack_Size <= 0
+        or else Stack_Size > System.Storage_Elements.Storage_Offset
+                               (Minicoro.Stack_Count'Last)
+      then
+         raise Coroutine_Error with "invalid stack size";
+      end if;
+
+      Minicoro.Create
+        (C          => Coro,
+         Func       => Raw.Wrapper_Entry,
+         Stack_Size => Minicoro.Stack_Count (Stack_Size),
+         Res        => Res);
+      if Res /= Minicoro.Success then
+         raise Coroutine_Error
+           with "Minicoro.Create failed: " & Minicoro.Result'Image (Res);
+      end if;
+
+      Pool (Slot).Coro       := Coro;
+      Pool (Slot).Is_Main    := False;
+      Pool (Slot).To_Clean   := False;
+      Pool (Slot).Is_Started := False;
+      By_Coro (Coro) := Slot;
+      Save_Occurrence (Pool (Slot).Exc, Null_Occurrence);
+   end Spawn_Slot;
 
    ------------
    -- Switch --
    ------------
 
    procedure Switch (C : Coroutine) is
+      pragma SPARK_Mode (Off);
+      --  Off: as Spawn. Dispatching operations cannot carry
+      --  Exceptional_Cases, and this one propagates whatever the resumed
+      --  coroutine died of.
    begin
-      C.Coroutine.Switch;
+      if C.Slot not in Valid_Slot then
+         raise Coroutine_Error with "uninitialized coroutine";
+      end if;
+      Switch_Slot (C.Slot);
    end Switch;
+
+   -----------------
+   -- Switch_Slot --
+   -----------------
+
+   procedure Switch_Slot (Slot : Valid_Slot) is
+      Res : Minicoro.Result;
+      Cur : Valid_Slot;
+   begin
+      Ensure_Booted;
+
+      if Slot = Current_Slot then
+         raise Coroutine_Error with "Trying to switch to the same coroutine";
+      elsif not Alive_Slot (Slot) then
+         raise Coroutine_Error with "Trying to switch to a dead coroutine";
+      end if;
+
+      --  From the next coroutine to run's point of view, the current
+      --  coroutine is what Previous_Slot shall be.
+      Cur := Current_Slot;
+      Raw.Save_Sec_Stack (Cur);
+      Previous_Slot := Cur;
+
+      --  A symmetric transfer, as PCL's co_call was: the target may be this
+      --  coroutine's parent, a sibling, or the main context, and it resumes
+      --  wherever it last stopped. Coro is No_Coroutine for the main
+      --  coroutine, which is exactly how Minicoro names the thread context.
+      Minicoro.Switch_To (Pool (Slot).Coro, Res);
+      if Res /= Minicoro.Success then
+         raise Coroutine_Error
+           with "Switch failed: " & Minicoro.Result'Image (Res);
+      end if;
+
+      Cur := Current_Slot;
+      Raw.Restore_Sec_Stack (Cur);
+
+      if Previous_Slot in Valid_Slot and then Pool (Previous_Slot).To_Clean
+      then
+         Reset (Previous_Slot);
+         if not Is_Null_Occurrence (Pool (Previous_Slot).Exc) then
+            Reraise_And_Clean (Previous_Slot);
+         end if;
+      end if;
+
+      if not Is_Null_Occurrence (Pool (Cur).Exc) then
+         Reraise_And_Clean (Cur);
+      end if;
+   end Switch_Slot;
 
    ----------
    -- Kill --
    ----------
 
    procedure Kill (C : Coroutine) is
+      pragma SPARK_Mode (Off);
+      --  Off: as Spawn.
    begin
-      C.Coroutine.Kill;
+      if C.Slot not in Valid_Slot then
+         raise Coroutine_Error with "uninitialized coroutine";
+      end if;
+      Kill_Slot (C.Slot);
    end Kill;
 
-   -----------
-   -- Reset --
-   -----------
+   ---------------
+   -- Kill_Slot --
+   ---------------
 
-   procedure Reset (C : in out Coroutine_Internal) is
-      Res : Minicoro.Result;
+   procedure Kill_Slot (Slot : Valid_Slot) is
    begin
-      if C.Coro /= Minicoro.No_Coroutine then
-         Minicoro.Destroy (C.Coro, Res);
-         pragma Assert (Res = Minicoro.Success);
-         C.Coro := Minicoro.No_Coroutine;
-      end if;
+      Ensure_Booted;
 
-      if C.Sec_Stack /= null then
-         System.Secondary_Stack.SS_Free (C.Sec_Stack);
-      end if;
-
-      C.Is_Started := False;
-      C.To_Clean := False;
-   end Reset;
-
-   ----------------
-   -- Initialize --
-   ----------------
-
-   overriding procedure Initialize (C : in out Coroutine_Internal) is
-   begin
-      C.Ref_Count := 0;
-      C.Parent := (Ada.Finalization.Controlled with Coroutine => null);
-      C.Coro := Minicoro.No_Coroutine;
-      C.Sec_Stack := null;
-      C.Is_Main := False;
-      C.To_Clean := False;
-      C.Is_Started := False;
-      Save_Occurrence (C.Exc, Null_Occurrence);
-   end Initialize;
-
-   --------------
-   -- Finalize --
-   --------------
-
-   overriding procedure Finalize (C : in out Coroutine_Internal) is
-      subtype Delegate_Class_Wide is Delegate'Class;
-      type Delegate_Access is access all Delegate_Class_Wide;
-      procedure Free is new Ada.Unchecked_Deallocation
-        (Delegate_Class_Wide, Delegate_Access);
-      D : Delegate_Access := C.D;
-   begin
-      if not C.Is_Main then
-         if C.Alive then
-            C.Kill;
-         end if;
-         Free (D);
-      end if;
-   end Finalize;
-
-   -----------
-   -- Alive --
-   -----------
-
-   function Alive (C : in out Coroutine_Internal) return Boolean is
-   begin
-      --  The main coroutine is always alive: it is the thread itself, and it
-      --  has no pool slot to hold.
-      return C.Is_Main or else C.Coro /= Minicoro.No_Coroutine;
-   end Alive;
-
-   -----------
-   -- Spawn --
-   -----------
-
-   procedure Spawn
-     (C          : in out Coroutine_Internal;
-      Stack_Size : System.Storage_Elements.Storage_Offset := 2**16)
-   is
-      Coro : Minicoro.Coroutine_Id;
-      Res  : Minicoro.Result;
-   begin
-      if C.Alive then
-         raise Coroutine_Error with "Coroutine already spawed";
-      end if;
-
-      Minicoro.Create
-        (C          => Coro,
-         Func       => Coroutine_Wrapper'Access,
-         Stack_Size => Minicoro.Stack_Count (Stack_Size),
-         User_Data  => C'Address,
-         Res        => Res);
-      if Res /= Minicoro.Success then
-         raise Program_Error
-           with "Minicoro.Create failed: " & Minicoro.Result'Image (Res);
-      end if;
-      C.Coro := Coro;
-      C.Is_Main := False;
-      C.To_Clean := False;
-      Save_Occurrence (C.Exc, Null_Occurrence);
-   end Spawn;
-
-   ------------
-   -- Switch --
-   ------------
-
-   procedure Switch (C : in out Coroutine_Internal) is
-      Res : Minicoro.Result;
-   begin
-      if C'Unrestricted_Access = Current_Coroutine_Internal then
-         raise Coroutine_Error with "Trying to switch to the same coroutine";
-      elsif not C.Alive then
-         raise Coroutine_Error with "Trying to switch to a dead coroutine";
-      end if;
-
-      --  From the next coroutine to run's point of view, the current coroutine
-      --  is what Previous_Coroutine_Ptr shall be.
-
-      Current_Coroutine_Internal.Sec_Stack := SSL.Get_Sec_Stack.all;
-      Previous_Coroutine := Current_Coroutine_Internal;
-
-      --  A symmetric transfer, as PCL's co_call was: the target may be this
-      --  coroutine's parent, a sibling, or the main context, and it resumes
-      --  wherever it last stopped. C.Coro is No_Coroutine for the main
-      --  coroutine, which is exactly how Minicoro names the thread context.
-      Minicoro.Switch_To (C.Coro, Res);
-      if Res /= Minicoro.Success then
-         raise Coroutine_Error
-           with "Switch failed: " & Minicoro.Result'Image (Res);
-      end if;
-
-      SSL.Set_Sec_Stack (Current_Coroutine_Internal.Sec_Stack);
-
-      if Previous_Coroutine.To_Clean then
-         Reset (Previous_Coroutine.all);
-         if not Is_Null_Occurrence (Previous_Coroutine.Exc) then
-            pragma Assert (Is_Null_Occurrence (C.Exc));
-            Reraise_And_Clean (Previous_Coroutine.Exc);
-         end if;
-      end if;
-
-      if not Is_Null_Occurrence (Current_Coroutine_Internal.Exc) then
-         Reraise_And_Clean (Current_Coroutine_Internal.Exc);
-      end if;
-   end Switch;
-
-   ----------
-   -- Kill --
-   ----------
-
-   procedure Kill (C : in out Coroutine_Internal) is
-   begin
-      if C'Unrestricted_Access = Main_Coroutine.Coroutine then
+      if Slot = Main_Slot then
          raise Coroutine_Error with "Cannot kill the main coroutine";
-
-      elsif not C.Alive then
+      elsif not Alive_Slot (Slot) then
          raise Coroutine_Error with "Coroutine already killed";
       end if;
 
-      if not C.Is_Started then
-         Reset (C);
+      if not Pool (Slot).Is_Started then
+         Reset (Slot);
          return;
       end if;
 
-      begin
-         raise Abort_Coroutine;
-      exception
-         when Exc : Abort_Coroutine =>
-            Save_Occurrence (C.Exc, Exc);
-      end;
+      Raw.Capture_Abort (Slot);
 
-      --  The following will switch to C, raise an exception that will unwind
-      --  its stack. Then, C's Coroutine_Wrapper instance will switch back to
-      --  the current coroutine.
-
-      C.Switch;
-
-      --  When coming back from C, the Switch routine is supposed to clean
-      --  *and* destroy C's Minicoro coroutine, so we are done.
-   end Kill;
+      --  The following will switch to Slot, raise an exception that will
+      --  unwind its stack. Then its Coroutine_Wrapper instance will switch
+      --  back to the current coroutine, which cleans and destroys it.
+      Switch_Slot (Slot);
+   end Kill_Slot;
 
    -----------------------
    -- Current_Coroutine --
    -----------------------
 
    function Current_Coroutine return Coroutine is
+      pragma SPARK_Mode (Off);
+      --  Off: a SPARK function may not write globals, and handing out a
+      --  reference has to count it.
+      Slot : Valid_Slot;
    begin
-      return Get_Coroutine (Current_Coroutine_Internal);
+      Ensure_Booted;
+      Slot := Current_Slot;
+      if Pool (Slot).Ref_Count < Natural'Last then
+         Pool (Slot).Ref_Count := Pool (Slot).Ref_Count + 1;
+      end if;
+      return (Slot => Slot);
    end Current_Coroutine;
 
    --------------------
@@ -414,8 +690,14 @@ package body Coroutines with SPARK_Mode => Off is
    --------------------
 
    function Main_Coroutine return Coroutine is
+      pragma SPARK_Mode (Off);
+      --  Off: as Current_Coroutine.
    begin
-      return Get_Coroutine (Main_Coroutine_Internal'Access);
+      Ensure_Booted;
+      if Pool (Main_Slot).Ref_Count < Natural'Last then
+         Pool (Main_Slot).Ref_Count := Pool (Main_Slot).Ref_Count + 1;
+      end if;
+      return (Slot => Main_Slot);
    end Main_Coroutine;
 
    -----------------------
@@ -423,75 +705,80 @@ package body Coroutines with SPARK_Mode => Off is
    -----------------------
 
    procedure Coroutine_Wrapper (Self : Minicoro.Valid_Id) is
-      package Conversions is new System.Address_To_Access_Conversions
-        (Coroutine_Internal);
-      C           : constant access Coroutine_Internal :=
-        Conversions.To_Pointer (Minicoro.User_Data (Self));
-      To_Previous : Boolean := False;
-
+      Slot        : Valid_Slot;
+      To_Previous : Boolean;
+      Ancestor    : Slot_Id;
    begin
-      C.Is_Started := True;
-
-      if System.Parameters.Sec_Stack_Dynamic then
-         C.Sec_Stack := null;
-      else
-         declare
-            Sec_Stack : System.Address
-               with Import, Address => C.Sec_Stack'Address;
-         begin
-            System.Secondary_Stack.SS_Allocate
-              (Sec_Stack,
-               System.Storage_Elements.Storage_Count
-                 (System.Parameters.Runtime_Default_Sec_Stack_Size));
-         end;
-      end if;
-      System.Secondary_Stack.SS_Init (C.Sec_Stack);
-      SSL.Set_Sec_Stack (C.Sec_Stack);
-
-      --  When leaving Callee, the coroutine is about to abort, so the
-      --  coroutine we will be switching to must clean this coroutine.
-
-      begin
-         C.D.Run;
-      exception
-         when Abort_Coroutine =>
-            --  The Kill primitive is supposed to resume execution to the
-            --  coroutine that invoked it.
-
-            To_Previous := True;
-
-         when Exc : others =>
-            Save_Occurrence (C.Exc, Exc);
-      end;
-
-      C.To_Clean := True;
-
-      if To_Previous then
-         Previous_Coroutine.Switch;
-      end if;
-
-      --  Get the nearest parent coroutine still alive and resume execution in
-      --  it.
-
-      declare
-         Alive_Parent : Coroutine_Internal_Access := C.Parent.Coroutine;
-      begin
-         while not Alive_Parent.Alive loop
-            Alive_Parent := Alive_Parent.Parent.Coroutine;
+      if By_Coro (Self) not in Valid_Slot then
+         --  Cannot happen: Spawn_Slot records the mapping before anything can
+         --  enter here. There is nowhere to report it to, so spin rather than
+         --  fall off the end of the coroutine's stack.
+         loop
+            null;
          end loop;
-         Alive_Parent.Switch;
+      end if;
+
+      Slot := By_Coro (Self);
+      Pool (Slot).Is_Started := True;
+      Raw.Init_Sec_Stack (Slot);
+
+      --  When leaving the delegate, the coroutine is about to abort, so the
+      --  coroutine we will be switching to must clean this one.
+
+      Raw.Run_Delegate (Slot, To_Previous);
+
+      Pool (Slot).To_Clean := True;
+
+      --  Hand control on. Every path out of here is a switch, and none of
+      --  them may raise: this is the landing pad the generated entry code
+      --  jumps to, with C convention and nothing above it on this stack. An
+      --  exception let out here would unwind off a coroutine stack that is
+      --  about to be freed, which is undefined rather than merely wrong. So
+      --  the switches are wrapped, and a failure falls through to the same
+      --  terminal spin as every other way of having nowhere to go.
+      begin
+         if To_Previous and then Previous_Slot in Valid_Slot then
+            Switch_Slot (Previous_Slot);
+         end if;
+
+         --  Get the nearest parent coroutine still alive and resume execution
+         --  in it. The walk is bounded by the pool size: a chain longer than
+         --  that would have to revisit a slot, and there is nowhere left to
+         --  go.
+         Ancestor := Pool (Slot).Parent;
+         for Unused in Valid_Slot loop
+            exit when Ancestor not in Valid_Slot or else Alive_Slot (Ancestor);
+            Ancestor := Pool (Ancestor).Parent;
+         end loop;
+
+         if Ancestor in Valid_Slot and then Alive_Slot (Ancestor) then
+            Switch_Slot (Ancestor);
+         else
+            Switch_Slot (Main_Slot);
+         end if;
+      exception
+         when others =>
+            null;
       end;
+
+      --  Unreachable on the ordinary path: nothing switches back into a
+      --  coroutine that has run to completion. Reached only if the hand-off
+      --  above failed outright, in which case spinning is the least harmful
+      --  thing left.
+      loop
+         null;
+      end loop;
    end Coroutine_Wrapper;
 
    -----------------------
    -- Reraise_And_Clean --
    -----------------------
 
-   procedure Reraise_And_Clean (Exc : in out Exception_Occurrence) is
+   procedure Reraise_And_Clean (Slot : Valid_Slot) is
       Saved_Exc : Exception_Occurrence;
    begin
-      Save_Occurrence (Saved_Exc, Exc);
-      Save_Occurrence (Exc, Null_Occurrence);
+      Save_Occurrence (Saved_Exc, Pool (Slot).Exc);
+      Save_Occurrence (Pool (Slot).Exc, Null_Occurrence);
       Reraise_Occurrence (Saved_Exc);
    end Reraise_And_Clean;
 

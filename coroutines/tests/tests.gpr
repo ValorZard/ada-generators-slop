@@ -31,6 +31,17 @@ project Tests is
       "test_secondary_stack.adb");
 
    package Compiler is
-      for Default_Switches ("Ada") use ("-gnat2022", "-gnatwae", "-gnatyg");
+      for Default_Switches ("Ada") use
+        ("-gnat2022", "-gnatwae", "-gnatyg", "-gnatX");
+
+      --  test_secondary_stack declares helpers taking Delegate'Class as
+      --  "in out" and only reads them. That was silent while Coroutines.
+      --  Coroutine was an Ada.Finalization.Controlled type -- GNAT does not
+      --  warn about an unwritten controlled formal -- and started warning
+      --  when it became a Finalizable record. -gnatwK/-gnatwU turn those two
+      --  warnings off for this file alone, so the test source stays exactly
+      --  as it was.
+      for Switches ("test_secondary_stack.adb") use
+        ("-gnat2022", "-gnatwae", "-gnatyg", "-gnatX", "-gnatwK", "-gnatwU");
    end Compiler;
 end Tests;
