@@ -14,8 +14,8 @@ procedure Test_Secondary_Stack is
    overriding procedure Run (D : in out Delegate);
 
    function Letters (N : Natural; C : Character) return String;
-   procedure Log (D : in out Delegate'Class; Message : String);
-   function Switch_Identity (D : in out Delegate'Class; S : String)
+   procedure Log (D : Delegate'Class; Message : String);
+   function Switch_Identity (D : Delegate'Class; S : String)
                              return String;
 
    -------------
@@ -31,7 +31,7 @@ procedure Test_Secondary_Stack is
    -- Log --
    ---------
 
-   procedure Log (D : in out Delegate'Class; Message : String) is
+   procedure Log (D : Delegate'Class; Message : String) is
    begin
       Put_Line (D.Name & ": " & Message);
    end Log;
@@ -40,7 +40,7 @@ procedure Test_Secondary_Stack is
    -- Switch_Identity --
    ---------------------
 
-   function Switch_Identity (D : in out Delegate'Class; S : String)
+   function Switch_Identity (D : Delegate'Class; S : String)
                              return String
    is
    begin

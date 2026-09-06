@@ -230,6 +230,50 @@ modified, could be IN`. It models `Write` as a no-op. The `[E0012]`
 `imprecise-address-specification` warning is the same limitation stated once.
 So `Code_Page` is analysed for its state machine, not for its effect.
 
+### Why `generators/` cannot be On, and why the tests cannot either
+
+Both were attempted; both fail for the same underlying reason, and it is
+worth understanding once rather than rediscovering.
+
+**A SPARK function may not write globals** (`E0005`). That single rule is
+what stops this layer, twice over.
+
+`Has_Next`, `Next`, `Element` and `Has_Element` all advance the generator,
+which means writing the pool. They cannot become procedures, because the
+`Iterable` aspect fixes their profiles and `for X of G` is the whole point of
+the package. So they must be `Off`. And then the *instantiation* is illegal
+too:
+
+```
+error: instantiation error at generators.ads:51
+  "Next" is not allowed in SPARK (due to entity declared with SPARK_Mode Off)
+```
+
+Since GNATprove analyses instantiations and never generic units, and no SPARK
+unit may instantiate this one, marking the generic `On` would produce exactly
+zero checks — forever. `Off` is the honest mode.
+
+**The tests cannot be `SPARK_Mode => On` either**, for three independent
+reasons found by turning them all on and reading what GNATprove said:
+
+1. `Create` is a function that writes globals, so it is `Off` — and that is
+   contagious to the caller's own data:
+   `error: "C" is not allowed in SPARK (due to entity declared with
+   SPARK_Mode Off)` on `C : constant Coroutine := Create (...)`. Every test
+   starts that way.
+2. `allocator not stored in object as part of assignment, declaration or
+   return is not allowed in SPARK` — `Create (new Null_Delegate)` is the
+   idiom in a dozen tests. Fixable by hoisting, but pervasive.
+3. Decisive: five tests print `Exception_Name (Exc) & ": " &
+   Exception_Message (Exc)` from a handler, and their `ref/` files contain
+   that output. SPARK rejects the choice parameter (`when Exc : ...`), so
+   making them SPARK means deleting the thing they assert. That would weaken
+   the tests to satisfy the prover, which is backwards.
+
+The tests are therefore deliberately outside SPARK, and should stay there.
+They are the behavioural oracle; the proof is a separate argument about the
+library, not about them.
+
 ### How `Coroutines` got into SPARK
 
 Two things had to change, and neither was avoidable.
@@ -687,14 +731,13 @@ destroyed while the coroutine ran.
   `Standard'Target_Name`.
 - Eleven `operator-reassociation` warnings remain under `--pedantic`. Purely
   cosmetic; see "Proof warnings", family 2.
-- `generators/` is still `SPARK_Mode => Off`. It is out for exactly the two
-  reasons `Coroutines` used to be — `Ada.Finalization.Controlled` and
-  ref-counted shared ownership — and `Coroutines` is now a worked example of
-  how to fix both. Expect the same shape: a pool of indices, the
-  `Finalizable` aspect, `Off` shims where a function has to write globals or
-  a dispatching operation has to raise. `Generator_Internal` also holds a
-  `Yield_Value : T` for a generic formal private type, which is new
-  territory.
+- `generators/` is `SPARK_Mode => Off` and, unlike the layers below it,
+  **cannot be On** — this was tried and the reason is structural, not
+  effort. It has been restructured anyway (pool of indices, `Finalizable`,
+  a `Raw` sub-package), so the tree now contains no
+  `Ada.Finalization.Controlled` at all and `Generators` matches `Coroutines`
+  slot for slot; only the mode differs. See "Why `generators/` cannot be
+  On" below before trying again.
 - `Coroutines` proves absence of runtime errors and its slot lifecycle, but
   carries no *functional* postconditions — nothing states what `Switch` does
   to the pool, only that it cannot go wrong. Contracts in the style of
