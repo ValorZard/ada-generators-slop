@@ -1,4 +1,4 @@
-with "pcl.gpr";
+with "minicoro.gpr";
 
 project Coroutines is
    for Source_Dirs use (".");

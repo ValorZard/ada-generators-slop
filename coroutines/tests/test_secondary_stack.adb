@@ -101,15 +101,18 @@ procedure Test_Secondary_Stack is
       Log (D, "about to terminate");
    end Run;
 
-   D_A : constant access Delegate := new Delegate'
+   type D_A_Ptr is access all Delegate;
+
+   D_A : constant D_A_Ptr := new Delegate'
      (Name => 'A', Next => Null_Coroutine);
-   D_B : constant access Delegate := new Delegate'
+   type D_B_Ptr is access all Delegate;
+   D_B : constant D_B_Ptr := new Delegate'
      (Name => 'B', Next => Null_Coroutine);
    A, B : Coroutine;
 
 begin
-   A := Create (Delegate_Access (D_A));
-   B := Create (Delegate_Access (D_B));
+   A := Create (Delegate_Access'(D_A.all'Unchecked_Access));
+   B := Create (Delegate_Access'(D_B.all'Unchecked_Access));
    D_A.Next := B;
    D_B.Next := A;
 

@@ -35,9 +35,11 @@ procedure Test_Foreign_Kill is
       Put_Line ("Parent: about to terminate");
    end Run;
 
-   D_Parent : constant access Parent_Delegate := new Parent_Delegate;
+   type D_Parent_Ptr is access all Parent_Delegate;
+
+   D_Parent : constant D_Parent_Ptr := new Parent_Delegate;
 begin
-   C_Parent := Create (Delegate_Access (D_Parent));
+   C_Parent := Create (Delegate_Access'(D_Parent.all'Unchecked_Access));
    C_Parent.Spawn;
    Put_Line ("Main: about to spawn Parent");
    C_Parent.Switch;

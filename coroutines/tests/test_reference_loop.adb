@@ -19,8 +19,10 @@ procedure Test_Reference_Loop is
       null;
    end Run;
 
-   D : constant access Delegate := new Delegate;
-   C : constant Coroutine := Create (Delegate_Access (D));
+   type D_Ptr is access all Delegate;
+
+   D : constant D_Ptr := new Delegate;
+   C : constant Coroutine := Create (Delegate_Access'(D.all'Unchecked_Access));
 
 begin
    D.Self := C;

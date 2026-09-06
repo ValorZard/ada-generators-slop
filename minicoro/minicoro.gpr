@@ -1,0 +1,49 @@
+--  Copyright (C) 2026, ada-generators contributors
+--  SPDX-License-Identifier: Apache-2.0
+
+project Minicoro is
+
+   for Source_Dirs use (".");
+   for Object_Dir use "obj";
+   for Languages use ("Ada");
+
+   --  Only Minicoro.Code_Page is platform specific: it is the one unit that
+   --  has to ask the operating system for memory it may execute. Windows sets
+   --  the OS environment variable to Windows_NT; nothing else does, so the
+   --  default is right without anyone having to say so. Override with
+   --  -XMINICORO_BACKEND=windows|posix if that guess is ever wrong.
+
+   type Backend_Kind is ("windows", "posix");
+   type OS_Env_Kind is ("Windows_NT", "unix");
+
+   OS_Env : OS_Env_Kind := external ("OS", "unix");
+
+   Backend : Backend_Kind := external ("MINICORO_BACKEND", "posix");
+
+   case OS_Env is
+      when "Windows_NT" =>
+         Backend := external ("MINICORO_BACKEND", "windows");
+      when "unix" =>
+         null;
+   end case;
+
+   package Naming is
+      case Backend is
+         when "windows" =>
+            for Body ("Minicoro.Code_Page")
+              use "minicoro-code_page__windows.adb";
+         when "posix" =>
+            for Body ("Minicoro.Code_Page")
+              use "minicoro-code_page__posix.adb";
+      end case;
+   end Naming;
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnat12", "-gnatwae", "-gnatyg");
+   end Compiler;
+
+   package Prove is
+      for Proof_Switches ("Ada") use ("--level=2", "--timeout=60");
+   end Prove;
+
+end Minicoro;

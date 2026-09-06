@@ -1,0 +1,19 @@
+--  Copyright (C) 2026, ada-generators contributors
+--  SPDX-License-Identifier: Apache-2.0
+
+with "minicoro.gpr";
+
+project Tests is
+   for Languages use ("Ada");
+   for Source_Dirs use (".");
+   for Object_Dir use "obj";
+   for Exec_Dir use "exe";
+   for Main use
+     ("test_golden.adb",     --  generated code == minicoro's own bytes
+      "test_coro.adb",       --  create/resume/yield/storage, incl. nesting
+      "dump_code.adb");      --  developer aid: hex dump of what we generate
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnat12", "-gnatwae", "-gnatyg");
+   end Compiler;
+end Tests;

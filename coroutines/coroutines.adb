@@ -14,19 +14,13 @@ with System.Parameters;
 with System.Soft_Links;
 pragma Warnings (On);
 
-with PCL; use PCL;
-
 package body Coroutines is
 
    use type System.Secondary_Stack.SS_Stack_Ptr;
+   use type Minicoro.Coroutine_Id;
+   use type Minicoro.Result;
 
    package SSL renames System.Soft_Links;
-
-   function Convert is new Ada.Unchecked_Conversion
-     (System.Address, PCL.Coroutine);
-
-   function Convert is new Ada.Unchecked_Conversion
-     (PCL.Coroutine, System.Address);
 
    function Get_Coroutine (C : Coroutine_Internal_Access) return Coroutine;
 
@@ -39,7 +33,7 @@ package body Coroutines is
       D          => null,
       Ref_Count  => 1,
       Parent     => (Ada.Finalization.Controlled with Coroutine => null),
-      Data       => Convert (PCL.Current),
+      Coro       => Minicoro.No_Coroutine,
       Sec_Stack  => null,
       Is_Main    => True,
       Is_Started => True,
@@ -52,7 +46,7 @@ package body Coroutines is
    --  Users should not be able to stop coroutine abortion. Use
    --  Standard'Abort_Signal instead???
 
-   procedure Coroutine_Wrapper (Data : System.Address)
+   procedure Coroutine_Wrapper (Self : Minicoro.Valid_Id)
      with Convention => C;
    --  Wrapper for coroutines execution: landing pad, catch exceptions, manage
    --  state finalization.
@@ -82,14 +76,16 @@ package body Coroutines is
    --------------------------------
 
    function Current_Coroutine_Internal return Coroutine_Internal_Access is
-      Current_Coroutine : constant PCL.Coroutine := Current;
+      Running : constant Minicoro.Coroutine_Id := Minicoro.Running_Coroutine;
       function Convert is new Ada.Unchecked_Conversion
         (System.Address, Coroutine_Internal_Access);
    begin
-      if Current_Coroutine = Convert (Main_Coroutine_Internal.Data) then
+      --  Minicoro names the thread's own context No_Coroutine, which is
+      --  exactly this package's main coroutine.
+      if Running = Minicoro.No_Coroutine then
          return Main_Coroutine_Internal'Access;
       else
-         return Convert (Get_Data (Current_Coroutine));
+         return Convert (Minicoro.User_Data (Running));
       end if;
    end Current_Coroutine_Internal;
 
@@ -214,10 +210,12 @@ package body Coroutines is
    -----------
 
    procedure Reset (C : in out Coroutine_Internal) is
+      Res : Minicoro.Result;
    begin
-      if C.Data /= Null_Address then
-         Delete (Convert (C.Data));
-         C.Data := Null_Address;
+      if C.Coro /= Minicoro.No_Coroutine then
+         Minicoro.Destroy (C.Coro, Res);
+         pragma Assert (Res = Minicoro.Success);
+         C.Coro := Minicoro.No_Coroutine;
       end if;
 
       if C.Sec_Stack /= null then
@@ -236,7 +234,7 @@ package body Coroutines is
    begin
       C.Ref_Count := 0;
       C.Parent := (Ada.Finalization.Controlled with Coroutine => null);
-      C.Data := Null_Address;
+      C.Coro := Minicoro.No_Coroutine;
       C.Sec_Stack := null;
       C.Is_Main := False;
       C.To_Clean := False;
@@ -269,7 +267,9 @@ package body Coroutines is
 
    function Alive (C : in out Coroutine_Internal) return Boolean is
    begin
-      return C.Data /= Null_Address;
+      --  The main coroutine is always alive: it is the thread itself, and it
+      --  has no pool slot to hold.
+      return C.Is_Main or else C.Coro /= Minicoro.No_Coroutine;
    end Alive;
 
    -----------
@@ -280,33 +280,24 @@ package body Coroutines is
      (C          : in out Coroutine_Internal;
       Stack_Size : System.Storage_Elements.Storage_Offset := 2**16)
    is
-      procedure Discard (A : System.Address);
-
-      -------------
-      -- Discard --
-      -------------
-
-      procedure Discard (A : System.Address) is
-      begin
-         null;
-      end Discard;
-
-      Coro : PCL.Coroutine;
+      Coro : Minicoro.Coroutine_Id;
+      Res  : Minicoro.Result;
    begin
       if C.Alive then
          raise Coroutine_Error with "Coroutine already spawed";
       end if;
 
-      Coro := Create
-        (Func  => Coroutine_Wrapper'Access,
-         Data  => C'Address,
-         Stack => Null_Address,
-         Size  => Integer (Stack_Size));
-      if Coro = PCL.Null_Coroutine then
-         --  TODO: check errno, etc.
-         raise Program_Error with "PCL.Create failed";
+      Minicoro.Create
+        (C          => Coro,
+         Func       => Coroutine_Wrapper'Access,
+         Stack_Size => Minicoro.Stack_Count (Stack_Size),
+         User_Data  => C'Address,
+         Res        => Res);
+      if Res /= Minicoro.Success then
+         raise Program_Error
+           with "Minicoro.Create failed: " & Minicoro.Result'Image (Res);
       end if;
-      C.Data := Convert (Coro);
+      C.Coro := Coro;
       C.Is_Main := False;
       C.To_Clean := False;
       Save_Occurrence (C.Exc, Null_Occurrence);
@@ -317,8 +308,9 @@ package body Coroutines is
    ------------
 
    procedure Switch (C : in out Coroutine_Internal) is
+      Res : Minicoro.Result;
    begin
-      if C.Data = Convert (Current) then
+      if C'Unrestricted_Access = Current_Coroutine_Internal then
          raise Coroutine_Error with "Trying to switch to the same coroutine";
       elsif not C.Alive then
          raise Coroutine_Error with "Trying to switch to a dead coroutine";
@@ -329,7 +321,17 @@ package body Coroutines is
 
       Current_Coroutine_Internal.Sec_Stack := SSL.Get_Sec_Stack.all;
       Previous_Coroutine := Current_Coroutine_Internal;
-      Call (Convert (C.Data));
+
+      --  A symmetric transfer, as PCL's co_call was: the target may be this
+      --  coroutine's parent, a sibling, or the main context, and it resumes
+      --  wherever it last stopped. C.Coro is No_Coroutine for the main
+      --  coroutine, which is exactly how Minicoro names the thread context.
+      Minicoro.Switch_To (C.Coro, Res);
+      if Res /= Minicoro.Success then
+         raise Coroutine_Error
+           with "Switch failed: " & Minicoro.Result'Image (Res);
+      end if;
+
       SSL.Set_Sec_Stack (Current_Coroutine_Internal.Sec_Stack);
 
       if Previous_Coroutine.To_Clean then
@@ -377,7 +379,7 @@ package body Coroutines is
       C.Switch;
 
       --  When coming back from C, the Switch routine is supposed to clean
-      --  *and* delete C's PCL coroutine, so we are done.
+      --  *and* destroy C's Minicoro coroutine, so we are done.
    end Kill;
 
    -----------------------
@@ -402,11 +404,11 @@ package body Coroutines is
    -- Coroutine_Wrapper --
    -----------------------
 
-   procedure Coroutine_Wrapper (Data : System.Address) is
+   procedure Coroutine_Wrapper (Self : Minicoro.Valid_Id) is
       package Conversions is new System.Address_To_Access_Conversions
         (Coroutine_Internal);
       C           : constant access Coroutine_Internal :=
-        Conversions.To_Pointer (Data);
+        Conversions.To_Pointer (Minicoro.User_Data (Self));
       To_Previous : Boolean := False;
 
    begin

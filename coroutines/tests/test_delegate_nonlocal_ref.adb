@@ -20,8 +20,10 @@ procedure Test_Delegate_Nonlocal_Ref is
       I := 1;
    end Run;
 
-   D : constant access Local_Delegate := new Local_Delegate;
-   C : constant Coroutine := Create (Delegate_Access (D));
+   type D_Ptr is access all Local_Delegate;
+
+   D : constant D_Ptr := new Local_Delegate;
+   C : constant Coroutine := Create (Delegate_Access'(D.all'Unchecked_Access));
 begin
    Put_Line ("Before: I =" & Natural'Image (I));
    C.Spawn;

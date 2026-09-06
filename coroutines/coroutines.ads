@@ -7,6 +7,8 @@ with Ada.Finalization;
 with System.Storage_Elements;
 use type System.Storage_Elements.Storage_Offset;
 
+with Minicoro;
+
 pragma Warnings (Off);
 private with System.Secondary_Stack;
 pragma Warnings (On);
@@ -96,8 +98,10 @@ private
       --  greatest parent for all coroutines. Used to resume execution after
       --  coroutine completion.
 
-      Data       : System.Address;
-      --  Coroutines back-end specific data
+      Coro       : Minicoro.Coroutine_Id;
+      --  Backing coroutine in the Minicoro pool, or No_Coroutine when this
+      --  one is not spawned. The main coroutine is always No_Coroutine: that
+      --  id names the thread's own context.
 
       Sec_Stack  : System.Secondary_Stack.SS_Stack_Ptr;
       --  Saved coroutine-specific secondary stack. Allocated (respectively

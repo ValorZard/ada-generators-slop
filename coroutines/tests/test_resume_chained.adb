@@ -22,8 +22,10 @@ procedure Test_Resume_Chained is
 
    overriding procedure Run (D : in out Delegate_A) is
       pragma Unreferenced (D);
-      D_B : constant access Delegate_B := new Delegate_B;
-      C_B : constant Coroutine := Create (Delegate_Access (D_B));
+      type D_B_Ptr is access all Delegate_B;
+      D_B : constant D_B_Ptr := new Delegate_B;
+      C_B : constant Coroutine :=
+        Create (Delegate_Access'(D_B.all'Unchecked_Access));
    begin
       Put_Line ("Coroutine A: started, about to spawn B");
       C_B.Spawn;
@@ -41,8 +43,11 @@ procedure Test_Resume_Chained is
       Put_Line ("Coroutine B: started, about to terminate");
    end Run;
 
-   D_A : constant access Delegate_A := new Delegate_A;
-   C_A : constant Coroutine := Create (Delegate_Access (D_A));
+   type D_A_Ptr is access all Delegate_A;
+
+   D_A : constant D_A_Ptr := new Delegate_A;
+   C_A : constant Coroutine :=
+     Create (Delegate_Access'(D_A.all'Unchecked_Access));
 begin
    Put_Line ("Main: about to spawn A");
    C_A.Spawn;
