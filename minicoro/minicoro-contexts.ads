@@ -22,14 +22,20 @@ with Minicoro.Machine_Code;
 
 private package Minicoro.Contexts with
   SPARK_Mode,
-  Abstract_State => (Backend_State with Part_Of => Minicoro.Pool),
+  Abstract_State => (Backend_State with Part_Of => Minicoro.Backend),
   Initializes    => Backend_State
 is
    --  A private child so that the generated code page and the "is the backend
-   --  up" flag can be declared Part_Of the parent's Pool. Without that, every
-   --  operation in Minicoro would have to name this package's state in its
-   --  own Global contract -- and a parent spec may not depend on its child,
-   --  so it could not even do so.
+   --  up" flag can be declared Part_Of the parent's Backend state. Without
+   --  that, every operation in Minicoro would have to name this package's
+   --  state in its own Global contract -- and a parent spec may not depend on
+   --  its child, so it could not even do so.
+   --
+   --  Part_Of Backend rather than Pool, which is what it used to be: the code
+   --  page is written once at elaboration and read-only thereafter, so it has
+   --  nothing to do with the per-coroutine pool it was formerly lumped in
+   --  with. Keeping them apart is what lets a lifecycle operation say it
+   --  reads the backend without also claiming to write it.
 
    use type FTAL.Stack_Region;
 

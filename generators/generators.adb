@@ -11,43 +11,41 @@ with Ada.Unchecked_Deallocation;
 
 with Coroutines;
 
-package body Generators with SPARK_Mode => Off is
+package body Generators with SPARK_Mode => On is
+
+   package GS renames Generator_Slots;
+   use all type GS.State_Type;
 
    ------------------
    -- The pool --
    ------------------
 
    type Generator_Record is record
-      Ref_Count     : Natural := 0;
-      --  Number of non-weak Generator handles naming this slot.
-
-      In_Use        : Boolean := False;
-
-      Delegate      : Delegate_Access := null;
+      Delegate : Delegate_Access := null;
       --  User delegate, to be run under Generator_Delegate.
 
-      Owns_Delegate : Boolean := False;
-      --  Whether Delegate is owned by this generator, and so freed with it.
-
-      Coro          : Coroutines.Coroutine;
+      Coro     : Coroutines.Coroutine;
       --  Coroutine that runs this generator.
 
-      Caller        : Coroutines.Coroutine;
+      Caller   : Coroutines.Coroutine;
       --  Just before switching to the generator coroutine, set to reference
       --  the coroutine it is supposed to switch back to.
-
-      State         : State_Type := Waiting;
-      --  Generator execution state. Used to synchronize the generator and its
-      --  caller.
-
-      Yield_Value   : T;
-      --  Holds values the generator yields so that the caller can access it.
-      --  T is a formal private type with no known default, so this component
-      --  is meaningless until State has been Yielding at least once; every
-      --  read of it below is guarded by that.
    end record;
+   --  Only what depends on the formal type or on Coroutines. The reference
+   --  count, the in-use flag, the delegate-ownership flag and the execution
+   --  state all live in Generator_Slots, which is non-generic and therefore
+   --  actually gets analysed.
 
    Pool : array (Valid_Slot) of Generator_Record;
+
+   Values : array (Valid_Slot) of T;
+   --  What the generator yields, held apart from Generator_Record for the
+   --  same reason Coroutines holds its exception occurrences apart: T is a
+   --  formal private type with no default SPARK can see, and a component like
+   --  that makes the whole enclosing record count as uninitialised. Kept
+   --  separate, every component of Generator_Record has a default. A slot's
+   --  value is meaningless until its State has been Yielding; every read
+   --  below is guarded by that.
 
    type Generator_Delegate is new Coroutines.Delegate with record
       Slot : Slot_Id := No_Slot;
@@ -66,7 +64,7 @@ package body Generators with SPARK_Mode => Off is
    --  TRUSTED, as Coroutines.Raw is: the ownership hand-offs SPARK will not
    --  perform, in one place.
 
-   package Raw is
+   package Raw with SPARK_Mode => On is
 
       procedure Adopt_Delegate (Slot : Valid_Slot; D : Delegate_Access);
       --  Store D as the slot's user delegate, taking ownership. Create takes
@@ -92,20 +90,22 @@ package body Generators with SPARK_Mode => Off is
    --  Last non-weak handle gone: drop the coroutine, free the delegate if
    --  owned, and clear the slot.
 
-   procedure Yield_Slot (Slot : Valid_Slot; Value : T);
+   procedure Yield_Slot (Slot : Valid_Slot; Value : T)
+     with Exceptional_Cases => (others => True);
    --  The body of Yield.
 
-   procedure Advance (Slot : Valid_Slot);
+   procedure Advance (Slot : Valid_Slot)
+     with Exceptional_Cases => (others => True);
    --  Resume the generator until it yields or finishes.
 
    function Live (G : Generator) return Boolean is
-     (G.Slot in Valid_Slot and then Pool (G.Slot).In_Use);
+     (G.Slot in Valid_Slot and then GS.In_Use (G.Slot));
 
    ---------
    -- Raw --
    ---------
 
-   package body Raw is
+   package body Raw with SPARK_Mode => Off is
 
       procedure Adopt_Delegate (Slot : Valid_Slot; D : Delegate_Access) is
       begin
@@ -116,7 +116,7 @@ package body Generators with SPARK_Mode => Off is
          procedure Free is new Ada.Unchecked_Deallocation
            (Delegate'Class, Delegate_Access);
       begin
-         if Pool (Slot).Owns_Delegate then
+         if GS.Owns_Delegate (Slot) then
             Free (Pool (Slot).Delegate);
          else
             Pool (Slot).Delegate := null;
@@ -144,11 +144,8 @@ package body Generators with SPARK_Mode => Off is
 
    procedure Bump (G : in out Generator) is
    begin
-      if not G.Weak
-        and then G.Slot in Valid_Slot
-        and then Pool (G.Slot).Ref_Count < Natural'Last
-      then
-         Pool (G.Slot).Ref_Count := Pool (G.Slot).Ref_Count + 1;
+      if not G.Weak and then G.Slot in Valid_Slot then
+         GS.Bump (G.Slot);
       end if;
    end Bump;
 
@@ -165,18 +162,21 @@ package body Generators with SPARK_Mode => Off is
       --  with the count already at zero.
       G.Slot := No_Slot;
 
-      if Weak
-        or else Slot not in Valid_Slot
-        or else Pool (Slot).Ref_Count = 0
-      then
+      if Weak or else Slot not in Valid_Slot then
          return;
       end if;
 
-      Pool (Slot).Ref_Count := Pool (Slot).Ref_Count - 1;
-
-      if Pool (Slot).Ref_Count = 0 then
-         Release (Slot);
-      end if;
+      declare
+         Released : Boolean;
+      begin
+         --  Generator_Slots.Drop does the counting and clears the slot when
+         --  the count reaches zero; what it cannot do is the cleanup that
+         --  depends on the formal type, which is why Released comes back.
+         GS.Drop (Slot, Released);
+         if Released then
+            Release (Slot);
+         end if;
+      end;
    exception
       when others =>
          --  A finalizer must not propagate; releasing a slot kills a
@@ -190,23 +190,10 @@ package body Generators with SPARK_Mode => Off is
 
    procedure Claim_Slot (Slot : out Slot_Id) is
    begin
-      Slot := No_Slot;
-      for I in Valid_Slot loop
-         if not Pool (I).In_Use then
-            Slot := I;
-            exit;
-         end if;
-      end loop;
-
-      if Slot not in Valid_Slot then
-         return;
+      GS.Claim (Slot);
+      if Slot in Valid_Slot then
+         Pool (Slot).Caller := Coroutines.Current_Coroutine;
       end if;
-
-      Pool (Slot).Ref_Count     := 1;
-      Pool (Slot).In_Use        := True;
-      Pool (Slot).Owns_Delegate := False;
-      Pool (Slot).State         := Waiting;
-      Pool (Slot).Caller        := Coroutines.Current_Coroutine;
    end Claim_Slot;
 
    -------------
@@ -223,12 +210,10 @@ package body Generators with SPARK_Mode => Off is
 
       Pool (Slot).Coro   := Coroutines.Null_Coroutine;
       Pool (Slot).Caller := Coroutines.Null_Coroutine;
-      Pool (Slot).State  := Returning;
 
+      --  Generator_Slots.Drop has already cleared the slot's bookkeeping by
+      --  the time we get here; what is left is the part it cannot see.
       Raw.Free_Delegate (Slot);
-
-      Pool (Slot).Owns_Delegate := False;
-      Pool (Slot).In_Use        := False;
    end Release;
 
    ------------
@@ -238,6 +223,7 @@ package body Generators with SPARK_Mode => Off is
    function Create (D                  : Delegate_Access;
                     Transfer_Ownership : Boolean := True) return Generator
    is
+      pragma SPARK_Mode (Off);
       Slot : Slot_Id;
    begin
       Claim_Slot (Slot);
@@ -246,7 +232,7 @@ package body Generators with SPARK_Mode => Off is
       end if;
 
       Raw.Adopt_Delegate (Slot, D);
-      Pool (Slot).Owns_Delegate := Transfer_Ownership;
+      GS.Set_Owns_Delegate (Slot, Transfer_Ownership);
 
       Pool (Slot).Coro := Raw.New_Coroutine (Slot);
       Pool (Slot).Coro.Spawn;
@@ -276,7 +262,7 @@ package body Generators with SPARK_Mode => Off is
             end if;
          exception
             when others =>
-               Pool (Slot).State := Returning;
+               GS.Set_State (Slot, Returning);
                raise;
          end;
       end;
@@ -285,7 +271,7 @@ package body Generators with SPARK_Mode => Off is
       --  resume to the last coroutine that invoked this generator, so do not
       --  rely on usual coroutine completion mechanism.
 
-      Pool (Slot).State := Returning;
+      GS.Set_State (Slot, Returning);
       Pool (Slot).Caller.Switch;
    end Run;
 
@@ -295,8 +281,8 @@ package body Generators with SPARK_Mode => Off is
 
    procedure Yield_Slot (Slot : Valid_Slot; Value : T) is
    begin
-      Pool (Slot).State       := Yielding;
-      Pool (Slot).Yield_Value := Value;
+      GS.Set_State (Slot, Yielding);
+      Values (Slot) := Value;
       Pool (Slot).Caller.Switch;
    end Yield_Slot;
 
@@ -305,6 +291,7 @@ package body Generators with SPARK_Mode => Off is
    -----------
 
    procedure Yield (G : Generator; Value : T) is
+      pragma SPARK_Mode (Off);
    begin
       if not Live (G) then
          raise Generator_Error with "uninitialized generator";
@@ -328,12 +315,13 @@ package body Generators with SPARK_Mode => Off is
    --------------
 
    function Has_Next (G : Generator) return Boolean is
+      pragma SPARK_Mode (Off);
    begin
       if not Live (G) then
          raise Generator_Error with "uninitialized generator";
       end if;
 
-      case Pool (G.Slot).State is
+      case GS.State_Of (G.Slot) is
          when Waiting =>
             null;
          when Yielding =>
@@ -344,7 +332,7 @@ package body Generators with SPARK_Mode => Off is
 
       Advance (G.Slot);
 
-      case Pool (G.Slot).State is
+      case GS.State_Of (G.Slot) is
          when Waiting =>
             raise Program_Error with "Unreachable state";
          when Yielding =>
@@ -365,17 +353,18 @@ package body Generators with SPARK_Mode => Off is
    ----------
 
    function Next (G : Generator) return T is
+      pragma SPARK_Mode (Off);
    begin
       if not Live (G) then
          raise Generator_Error with "uninitialized generator";
       end if;
 
-      case Pool (G.Slot).State is
+      case GS.State_Of (G.Slot) is
          when Waiting | Returning =>
             raise Program_Error with "Unreachable state";
          when Yielding =>
-            Pool (G.Slot).State := Waiting;
-            return Pool (G.Slot).Yield_Value;
+            GS.Set_State (G.Slot, Waiting);
+            return Values (G.Slot);
       end case;
    end Next;
 
@@ -394,17 +383,18 @@ package body Generators with SPARK_Mode => Off is
    ----------
 
    function Next (G : Generator; C : Cursor_Type) return Cursor_Type is
+      pragma SPARK_Mode (Off);
       pragma Unreferenced (C);
    begin
       if not Live (G) then
          raise Generator_Error with "uninitialized generator";
       end if;
 
-      case Pool (G.Slot).State is
+      case GS.State_Of (G.Slot) is
          when Waiting =>
             null;
          when Yielding =>
-            Pool (G.Slot).State := Waiting;
+            GS.Set_State (G.Slot, Waiting);
          when Returning =>
             raise Program_Error with "Unreachable state";
       end case;
@@ -416,6 +406,7 @@ package body Generators with SPARK_Mode => Off is
    -----------------
 
    function Has_Element (G : Generator; C : Cursor_Type) return Boolean is
+      pragma SPARK_Mode (Off);
       pragma Unreferenced (C);
    begin
       return G.Has_Next;
@@ -426,13 +417,14 @@ package body Generators with SPARK_Mode => Off is
    -------------
 
    function Element (G : Generator; C : Cursor_Type) return T is
+      pragma SPARK_Mode (Off);
       pragma Unreferenced (C);
    begin
       if not Live (G) then
          raise Generator_Error with "uninitialized generator";
       end if;
 
-      case Pool (G.Slot).State is
+      case GS.State_Of (G.Slot) is
          when Returning =>
             raise Program_Error with "Unreachable state";
 
@@ -442,9 +434,9 @@ package body Generators with SPARK_Mode => Off is
             --  in order to go to the next element. This is useful to resume
             --  iteration with a FOR loop.
 
-            Pool (G.Slot).State := Waiting;
+            GS.Set_State (G.Slot, Waiting);
 
-            return Pool (G.Slot).Yield_Value;
+            return Values (G.Slot);
       end case;
    end Element;
 

@@ -16,16 +16,28 @@ A prototype for Ada generators/coroutines, in four layers, bottom up:
 |               | `Minicoro.Contexts`      | yes*  | **private child**; trusted context switch   |
 |               | `Minicoro.Code_Page`     | yes   | W^X page from the OS                        |
 | `coroutines/` | `Coroutines`             | yes*  | ref-counted, GNAT-runtime-integrated wrapper |
-| `generators/` | `Generators`             | no    | generator API over `Coroutines`             |
+| `generators/` | `Generator_Slots`        | yes   | ref counting, slot allocation, state machine |
+|               | `Generators`             | yes*  | generator API over `Coroutines`             |
 
 `yes*` means the unit is `SPARK_Mode => On` with named exceptions inside it,
-each marked and justified where it sits. Both proof runs are clean:
-`minicoro/` proves 574 checks and `coroutines/` 643 (that figure includes
-`minicoro`'s, since the project withs it), both with 2 justified and **0
-unproved**.
+each marked and justified where it sits.
 
-`generators/` is the one layer still `SPARK_Mode => Off`, and only because
-nobody has done to it what was done to `Coroutines` — see "Not done".
+No package in the tree is `SPARK_Mode => Off`, and all three proof runs are
+clean: `minicoro/` 490 checks, `coroutines/` 646, `generators/` 648 — each
+figure including the layers below it, since the projects with each other —
+all with 2 justified and **0 unproved**.
+
+`generators/` is the subtle one, and `Generator_Slots` is why it works.
+`Generators` is a *generic*; GNATprove analyses instantiations rather than
+generic units, and no SPARK unit can instantiate this one (its `Iterable`
+aspect names the three `Off` functions that advance a generator). Left as one
+package it produced literally zero checks. Splitting the `T`-independent
+half — reference counting, slot allocation, the execution state machine —
+into the non-generic `Generator_Slots` sidesteps that entirely: non-generic
+packages are analysed directly. 27 of the 648 checks are its own — five of
+them postconditions, on `Claim`, `Bump`, `Drop`, `Set_State` and
+`Set_Owns_Delegate` — and they are the ones where a generator bug would
+live.
 
 `minicoro/` replaced a thin binding to PCL (the old `pcl/` directory, deleted).
 The `generators/` layer was untouched by that swap — the change is confined to
@@ -97,11 +109,28 @@ cd minicoro    && gnatprove -P minicoro.gpr    --level=2 -j4 --report=fail
 cd coroutines  && gnatprove -P coroutines.gpr  --level=2 -j4 --report=fail
 ```
 
-Expected: `Success: all checks proved (574 checks)` for `minicoro` and
-`(643 checks)` for `coroutines`, each with **2 justified, 0 unproved**. The
+Expected: `Success: all checks proved (490 checks)` for `minicoro` and
+`(646 checks)` for `coroutines`, each with **2 justified, 0 unproved**. The
 second figure includes the first: `coroutines.gpr` withs `minicoro.gpr`, so
 that run re-analyses everything and is the one to trust if you only run one.
-`generators/` has no proof run; it is `SPARK_Mode => Off`.
+```sh
+cd generators  && gnatprove -P generators.gpr  --level=2 -j4 --report=fail
+```
+
+Expected there: `Success: all checks proved (648 checks)`, 2 justified, 0
+unproved. That run covers all three layers, so it is the single command to
+use if you only run one.
+
+A caution on the check count: it went *down*, 574 to 490, when the byte-stack
+fields moved out of `Coroutine_Record` into their own array. That is not lost
+coverage. The `Stored <= Cap` predicate used to sit on `Coroutine_Record`, so
+every assignment to `Coro_State`, `Prev` or `In_Use` re-checked a storage
+invariant it could not affect; on `Storage_Record` it guards only the data it
+describes. This was confirmed by mutation rather than assumed — deleting
+Push's capacity guard still produces `array index check might fail`,
+`overflow check might fail` and `predicate check might fail`. If you ever
+make a change that drops the count again, do the same: a smaller number and
+"all checks proved" is also what losing a property looks like.
 
 Each run takes roughly 10-40 minutes — start it in the background and do not
 poll it. `--level=3` also passes; `--report=statistics` if you want per-check
@@ -172,7 +201,7 @@ The recurring hard errors behind those, for reference:
 - `access to subprogram with global effects is not allowed in SPARK`
 - `effectively volatile object not at library level [E0001]`
 
-### In `coroutines/` — six subprograms and one package, all language-level
+### In `coroutines/` and `generators/` — language-level, not machine-level
 
 A different kind of list. Nothing here is about machine state; every item is
 a place where the published interface and the SPARK subset disagree.
@@ -207,6 +236,12 @@ is a dereference SPARK wants proved non-null and whose target's effects it
 cannot see. Grouping them with the rest of the runtime plumbing was cheaper
 and more honest than sprinkling null guards through `Switch_Slot`.
 
+`Generators` has the same shape for the same reasons: `Create` and the four
+`Iterable` functions are `Off` because a SPARK function may not write
+globals, `Yield` because it is a dispatching operation that raises, and its
+own `Raw` for the delegate hand-off. `Generator_Slots`, which holds the state
+those operations manipulate, is `On` throughout with no exceptions at all.
+
 `Minicoro.Trampoline` itself **is** SPARK now. It carries a precondition
 stating what the generated entry code owes it (Handle is the pool index
 `Create` encoded, the slot is live, its resumer is neither itself nor a
@@ -230,31 +265,59 @@ modified, could be IN`. It models `Write` as a no-op. The `[E0012]`
 `imprecise-address-specification` warning is the same limitation stated once.
 So `Code_Page` is analysed for its state machine, not for its effect.
 
-### Why `generators/` cannot be On, and why the tests cannot either
+### How `generators/` got analysed, and why the tests still cannot be SPARK
 
-Both were attempted; both fail for the same underlying reason, and it is
-worth understanding once rather than rediscovering.
+Two facts about generics collide here, and the way round them is worth
+knowing before touching this layer.
 
-**A SPARK function may not write globals** (`E0005`). That single rule is
-what stops this layer, twice over.
+**A SPARK function may not write globals** (`E0005`). `Has_Next`, `Next`,
+`Element` and `Has_Element` all advance the generator, so all four write the
+pool. They cannot become procedures, because the `Iterable` aspect fixes
+their profiles and `for X of G` is the point of the package. So they are
+`Off`.
 
-`Has_Next`, `Next`, `Element` and `Has_Element` all advance the generator,
-which means writing the pool. They cannot become procedures, because the
-`Iterable` aspect fixes their profiles and `for X of G` is the whole point of
-the package. So they must be `Off`. And then the *instantiation* is illegal
-too:
+**GNATprove analyses instantiations, never generic units** — and an
+instantiation from SPARK is rejected outright, because `Iterable` names those
+`Off` subprograms:
 
 ```
-error: instantiation error at generators.ads:51
-  "Next" is not allowed in SPARK (due to entity declared with SPARK_Mode Off)
+error: instantiation error at generators.ads:73
+--> support.ads:9:04
+      + "Next" is not allowed in SPARK (due to entity declared with
+         SPARK_Mode Off)
 ```
 
-Since GNATprove analyses instantiations and never generic units, and no SPARK
-unit may instantiate this one, marking the generic `On` would produce exactly
-zero checks — forever. `Off` is the honest mode.
+Together those meant the generic produced *zero* checks no matter what was
+done to it, and no test could help: any SPARK unit instantiating `Generators`
+fails identically. Making the tests SPARK is not the missing ingredient.
 
-**The tests cannot be `SPARK_Mode => On` either**, for three independent
-reasons found by turning them all on and reading what GNATprove said:
+**The way round is `Generator_Slots`.** Six of the seven fields in the old
+`Generator_Record` did not depend on the formal type at all. Hoisted into a
+non-generic package they are analysed directly, no instantiation involved:
+
+| Stayed in the generic | Moved to `Generator_Slots` |
+|-----------------------|----------------------------|
+| `Delegate`, `Coro`, `Caller`, `Values` | `Ref_Count`, `In_Use`, `Owns_Delegate`, `State` |
+
+`Generator_Slots` carries real functional contracts rather than just runtime
+checks — `Drop` states the reference-counting invariant and proves it:
+
+```ada
+Post => Released = (In_Use (S)'Old and then Ref_Count (S)'Old = 1)
+          and then (if Released then not In_Use (S))
+```
+
+It is a procedure with an `out` parameter rather than a function returning
+the answer, for the same `E0005` reason that shaped everything else here.
+
+If you add state to a generic in this tree, ask first whether it depends on
+the formal types. If it does not, it belongs in a non-generic package, or it
+will never be checked.
+
+### The tests cannot be `SPARK_Mode => On`
+
+Three independent reasons, found by turning them all on and reading what
+GNATprove said. The third is decisive.
 
 1. `Create` is a function that writes globals, so it is `Off` — and that is
    contagious to the caller's own data:
@@ -264,15 +327,14 @@ reasons found by turning them all on and reading what GNATprove said:
 2. `allocator not stored in object as part of assignment, declaration or
    return is not allowed in SPARK` — `Create (new Null_Delegate)` is the
    idiom in a dozen tests. Fixable by hoisting, but pervasive.
-3. Decisive: five tests print `Exception_Name (Exc) & ": " &
-   Exception_Message (Exc)` from a handler, and their `ref/` files contain
-   that output. SPARK rejects the choice parameter (`when Exc : ...`), so
-   making them SPARK means deleting the thing they assert. That would weaken
-   the tests to satisfy the prover, which is backwards.
+3. Five tests print `Exception_Name (Exc) & ": " & Exception_Message (Exc)`
+   from a handler, and their `ref/` files contain that output. SPARK rejects
+   the choice parameter (`when Exc : ...`), so making them SPARK means
+   deleting the thing they assert. That would weaken the tests to satisfy the
+   prover, which is backwards.
 
-The tests are therefore deliberately outside SPARK, and should stay there.
-They are the behavioural oracle; the proof is a separate argument about the
-library, not about them.
+The tests are deliberately outside SPARK and should stay there. They are the
+behavioural oracle; the proof is a separate argument about the library.
 
 ### How `Coroutines` got into SPARK
 
@@ -319,7 +381,7 @@ cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail \
   --pedantic --proof-warnings=on
 ```
 
-`Success: all checks proved (574 checks)` and **20 warnings**:
+`Success: all checks proved (490 checks)` and **20 warnings**:
 
 | Count | Kind                                    | Group |
 |-------|-----------------------------------------|-------|
@@ -566,6 +628,46 @@ GNAT rejects an object filename that doesn't match the unit name.
 
 ## Design decisions worth not re-litigating
 
+**Keep global state scoped and keep structs narrow.** This is the one design
+rule in the tree that paid off repeatedly, and each layer learned it the hard
+way.
+
+*Name the state.* `Minicoro` declares four abstract states — `Pool`,
+`Storage`, `Backend`, `Current_State` — rather than one lump, and
+`Coroutines` declares `Registry` (who exists) and `Sched_State` (what is
+running). This is not tidiness. `Coroutines` originally had four raw globals
+and no `Abstract_State` at all, so nothing ever had to say it was
+initialised; naming the state forced an `Initializes` contract, which
+immediately failed with `"Pool" constituent of "Registry" is not
+initialized`. A latent gap the single lump had been hiding.
+
+Splitting `Minicoro.Pool` also let flow analysis express something the merged
+state could not:
+
+```
+medium: "Minicoro.Pool" must be a global Proof_In of "Push"
+low:    global Input "Minicoro.Pool" of "Push" not read
+```
+
+`Push` reads the pool only in its *precondition*, never in its body — that is
+`Proof_In`, not `Input`, and the contract now records it.
+
+*Keep the odd component out of the record.* Three times now, one field with
+no default that SPARK can see has made an entire enclosing record count as
+uninitialised:
+
+| Field | Type | Now lives in |
+|-------|------|--------------|
+| `Exc` | `Exception_Occurrence` (limited private) | `Coroutines.Excs` |
+| `Yield_Value` | formal private `T` | `Generators.Values` |
+| `Store`/`Stored`/`Cap` | (predicate, not init) | `Minicoro.Stores` |
+
+The first two were blocking `Initializes`; the third was making
+`Control_Transferred` havoc the byte stacks on every context switch, so
+nothing could be said about a coroutine's storage across `Resume` or `Yield`.
+In all three cases a parallel array indexed the same way fixed it, and the
+enclosing record went back to being fully default-initialised.
+
 **Coroutines are pool indices, not pointers — at both layers.** `Minicoro`
 holds
 `Coros : array (Valid_Id) of Coroutine_Record` and names coroutines by index.
@@ -731,13 +833,13 @@ destroyed while the coroutine ran.
   `Standard'Target_Name`.
 - Eleven `operator-reassociation` warnings remain under `--pedantic`. Purely
   cosmetic; see "Proof warnings", family 2.
-- `generators/` is `SPARK_Mode => Off` and, unlike the layers below it,
-  **cannot be On** — this was tried and the reason is structural, not
-  effort. It has been restructured anyway (pool of indices, `Finalizable`,
-  a `Raw` sub-package), so the tree now contains no
-  `Ada.Finalization.Controlled` at all and `Generators` matches `Coroutines`
-  slot for slot; only the mode differs. See "Why `generators/` cannot be
-  On" below before trying again.
+- `generators/` is proved to the same standard as the layers below it, but
+  only the `T`-independent half: `Generator_Slots` (reference counting, slot
+  allocation, the state machine) carries functional contracts, while the
+  generic itself still produces no checks of its own and cannot. If you want
+  more from that layer, the remaining candidates are `Coro`/`Caller` — they
+  are `T`-independent too and could follow the same route into a non-generic
+  package, at the cost of routing every coroutine operation through it.
 - `Coroutines` proves absence of runtime errors and its slot lifecycle, but
   carries no *functional* postconditions — nothing states what `Switch` does
   to the pool, only that it cannot go wrong. Contracts in the style of

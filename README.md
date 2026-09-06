@@ -81,7 +81,8 @@ Minicoro.Contexts       SPARK   except the switch itself and its plumbing
 Minicoro.Code_Page      SPARK   W^X page from the OS
 Coroutines              SPARK   except where the published API and the
                                 SPARK subset disagree
-Generators              --      not yet converted
+Generator_Slots         SPARK   generator ref counting + slot lifecycle
+Generators              SPARK   except the iteration interface
 ```
 
 All of `minicoro/` is `SPARK_Mode => On` except six subprograms, each marked
@@ -104,9 +105,20 @@ count a reference; and `Exceptional_Cases` is not accepted on a dispatching
 operation, yet `Spawn`/`Switch`/`Kill` raise and must stay primitives of a
 tagged type for the prefix notation the codebase uses.
 
-`Generators` is the one layer still outside. It is out for the two reasons
-`Coroutines` used to be, and `Coroutines` is now the worked example of how to
-fix them.
+`Generators` needed one more move, because it is generic and GNATprove
+analyses instantiations rather than generic units — and no SPARK unit can
+instantiate it, since its `Iterable` aspect names the three functions that
+advance a generator, which must be outside SPARK because a SPARK function may
+not write globals. Left as one package it produced *zero* checks.
+
+Six of its seven per-generator fields turned out not to depend on the yielded
+type at all, so they moved into `Generator_Slots`, which is non-generic and
+therefore analysed directly. That is where the reference counting, slot
+allocation and execution state machine now live, with functional contracts
+rather than just runtime checks — `Drop` states the invariant that a slot is
+released exactly when its last reference goes, and proves it. What remains in
+the generic is what genuinely depends on the type: the yielded values, the
+user delegate, and the two coroutine handles.
 
 At elaboration, `Minicoro.Machine_Code` assembles the switch routine from
 typed instruction encoders; `Minicoro.Code_Page` writes those bytes into a page
@@ -159,11 +171,11 @@ What is proved and what is assumed
 ----------------------------------
 
 Being precise about this matters more than the headline number, which is
-`Success: all checks proved` — 574 checks for `minicoro` and 643 for
-`coroutines`, the latter including the former since its project withs it.
-That is 371 run-time checks, 107 functional contracts, 19 assertions, 68
-termination checks and the flow analysis, with two justifications (see
-below) and nothing unproved.
+`Success: all checks proved` — 490 checks for `minicoro`, 646 for
+`coroutines` and 648 for `generators`, each figure including the layers below
+it since the projects with each other. The full run is 351 run-time checks,
+112 functional contracts, 19 assertions, 72 termination checks and the flow
+analysis, with two justifications (see below) and nothing unproved.
 
 **Proved** (GNATprove, `gnatprove -P coroutines.gpr`, which covers both
 layers):
@@ -189,6 +201,12 @@ layers):
   ref-counting bug would live, which is what made the rewrite worth doing.
   There are no functional postconditions there yet: it is proved not to go
   wrong, not proved to do anything in particular.
+* `Generator_Slots` — the generator equivalent, and the one place in the tree
+  with functional contracts on reference counting rather than just absence of
+  runtime errors: `Claim` establishes that a fresh slot is in use with a
+  count of one, `Drop` that a slot is released exactly when its last
+  reference goes, and `Set_State`/`Set_Owns_Delegate` that they change what
+  they name and nothing else.
 
 **Assumed.** Eight things, each marked in the source:
 

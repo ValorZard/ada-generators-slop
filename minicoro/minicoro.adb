@@ -16,8 +16,9 @@ with Minicoro.FTAL;
 
 package body Minicoro with
   SPARK_Mode,
-  Refined_State => (Pool          => (Coros, Backend_Up, Main_Ctx,
-                                       Contexts.Backend_State),
+  Refined_State => (Pool          => (Coros, Main_Ctx),
+                    Storage       => Stores,
+                    Backend       => (Backend_Up, Contexts.Backend_State),
                     Current_State => Current)
 is
    use System.Storage_Elements;
@@ -33,18 +34,30 @@ is
 
       Ctx   : Contexts.Context;
       Stack : Contexts.Stack_Handle;
+   end record;
 
+   type Storage_Record is record
       Store  : Store_Buffer  := [others => 0];
       Stored : Storage_Count := 0;
       Cap    : Storage_Count := 0;
    end record
-     with Dynamic_Predicate => Coroutine_Record.Stored <= Coroutine_Record.Cap;
+     with Dynamic_Predicate => Storage_Record.Stored <= Storage_Record.Cap;
    --  The predicate is the storage API's whole safety argument in one line:
    --  a slot never holds more bytes than it has room for.
+   --
+   --  A separate array from Coros, not a set of components in it, and the
+   --  reason is Control_Transferred. That helper havocs Coros to model the
+   --  fact that control ran elsewhere across a switch; with the byte stacks
+   --  inside Coros it havoc'd those too, so nothing could be said about a
+   --  coroutine's storage across Resume or Yield. Held apart, the switch says
+   --  nothing about the byte stacks -- which is the truth, since the assembly
+   --  never touches them.
 
    type Pool_Array is array (Valid_Id) of Coroutine_Record;
+   type Store_Array is array (Valid_Id) of Storage_Record;
 
    Coros      : Pool_Array;
+   Stores     : Store_Array;
    Main_Ctx   : Contexts.Context;
    --  The thread's own context. No_Coroutine names it, so that the main
    --  program and a coroutine are the same kind of thing to Transfer.
@@ -136,10 +149,10 @@ is
      (if C = No_Coroutine then Dead else Coros (C).Coro_State);
 
    function Bytes_Stored (C : Coroutine_Id) return Storage_Count is
-     (if C = No_Coroutine then 0 else Coros (C).Stored);
+     (if C = No_Coroutine then 0 else Stores (C).Stored);
 
    function Storage_Size (C : Coroutine_Id) return Storage_Count is
-     (if C = No_Coroutine then 0 else Coros (C).Cap);
+     (if C = No_Coroutine then 0 else Stores (C).Cap);
 
    function Free_Space (C : Coroutine_Id) return Storage_Count is
      (Storage_Size (C) - Bytes_Stored (C));
@@ -297,8 +310,8 @@ is
 
       Coros (Slot).Func       := Func;
       Coros (Slot).Prev       := No_Coroutine;
-      Coros (Slot).Stored     := 0;
-      Coros (Slot).Cap        := Storage_Size;
+      Stores (Slot).Stored     := 0;
+      Stores (Slot).Cap        := Storage_Size;
       Coros (Slot).Coro_State := Suspended;
       Coros (Slot).In_Use     := True;
 
@@ -324,8 +337,8 @@ is
       Coros (C).In_Use     := False;
       Coros (C).Func       := null;
       Coros (C).Prev       := No_Coroutine;
-      Coros (C).Stored     := 0;
-      Coros (C).Cap        := 0;
+      Stores (C).Stored     := 0;
+      Stores (C).Cap        := 0;
 
       Res := Success;
    end Destroy;
@@ -504,20 +517,20 @@ is
    ----------
 
    procedure Push (C : Valid_Id; Src : Byte_Array; Res : out Result) is
-      Base : constant Storage_Count := Coros (C).Stored;
+      Base : constant Storage_Count := Stores (C).Stored;
    begin
-      if Src'Length > Coros (C).Cap - Base then
+      if Src'Length > Stores (C).Cap - Base then
          Res := Not_Enough_Space;
          return;
       end if;
 
       for I in Src'Range loop
-         Coros (C).Store (Base + 1 + (I - Src'First)) := Src (I);
-         pragma Loop_Invariant (Coros (C).Stored = Base);
-         pragma Loop_Invariant (Coros (C).Cap = Coros (C).Cap'Loop_Entry);
+         Stores (C).Store (Base + 1 + (I - Src'First)) := Src (I);
+         pragma Loop_Invariant (Stores (C).Stored = Base);
+         pragma Loop_Invariant (Stores (C).Cap = Stores (C).Cap'Loop_Entry);
       end loop;
 
-      Coros (C).Stored := Base + Src'Length;
+      Stores (C).Stored := Base + Src'Length;
       Res := Success;
    end Push;
 
@@ -527,21 +540,21 @@ is
 
    procedure Pop (C : Valid_Id; Dest : out Byte_Array; Res : out Result) is
    begin
-      if Dest'Length > Coros (C).Stored then
+      if Dest'Length > Stores (C).Stored then
          Dest := [others => 0];
          Res  := Not_Enough_Space;
          return;
       end if;
 
       declare
-         Base : constant Storage_Count := Coros (C).Stored - Dest'Length;
+         Base : constant Storage_Count := Stores (C).Stored - Dest'Length;
       begin
          for I in Dest'Range loop
-            Dest (I) := Coros (C).Store (Base + 1 + (I - Dest'First));
+            Dest (I) := Stores (C).Store (Base + 1 + (I - Dest'First));
             pragma Loop_Invariant
-              (Coros (C).Stored = Coros (C).Stored'Loop_Entry);
+              (Stores (C).Stored = Stores (C).Stored'Loop_Entry);
          end loop;
-         Coros (C).Stored := Base;
+         Stores (C).Stored := Base;
       end;
 
       Res := Success;
@@ -553,17 +566,17 @@ is
 
    procedure Peek (C : Valid_Id; Dest : out Byte_Array; Res : out Result) is
    begin
-      if Dest'Length > Coros (C).Stored then
+      if Dest'Length > Stores (C).Stored then
          Dest := [others => 0];
          Res  := Not_Enough_Space;
          return;
       end if;
 
       declare
-         Base : constant Storage_Count := Coros (C).Stored - Dest'Length;
+         Base : constant Storage_Count := Stores (C).Stored - Dest'Length;
       begin
          for I in Dest'Range loop
-            Dest (I) := Coros (C).Store (Base + 1 + (I - Dest'First));
+            Dest (I) := Stores (C).Store (Base + 1 + (I - Dest'First));
          end loop;
       end;
 

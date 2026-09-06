@@ -21,8 +21,8 @@
 
 package Minicoro with
   SPARK_Mode,
-  Abstract_State => (Pool, Current_State),
-  Initializes    => (Pool, Current_State)
+  Abstract_State => (Pool, Storage, Backend, Current_State),
+  Initializes    => (Pool, Storage, Backend, Current_State)
 is
 
    pragma Unevaluated_Use_Of_Old (Allow);
@@ -96,14 +96,14 @@ is
    --  State of C. A never-allocated or released id reads as Dead.
 
    function Bytes_Stored (C : Coroutine_Id) return Storage_Count
-     with Global => (Input => Pool),
+     with Global => (Input => Storage),
           Post   => Bytes_Stored'Result <= Storage_Size (C);
 
    function Storage_Size (C : Coroutine_Id) return Storage_Count
-     with Global => (Input => Pool);
+     with Global => (Input => Storage);
 
    function Free_Space (C : Coroutine_Id) return Storage_Count
-     with Global => (Input => Pool),
+     with Global => (Input => Storage),
           Post   => Free_Space'Result = Storage_Size (C) - Bytes_Stored (C);
 
    function Running_Coroutine return Coroutine_Id
@@ -124,7 +124,7 @@ is
       Stack_Size   : Stack_Count   := Default_Stack_Size;
       Storage_Size : Storage_Count := Max_Storage;
       Res          : out Result)
-     with Global => (In_Out => Pool),
+     with Global => (In_Out => (Pool, Storage, Backend)),
           Post   =>
             (if Res = Success then
                C in Valid_Id
@@ -137,14 +137,15 @@ is
    --  begin executing Func.
 
    procedure Destroy (C : Coroutine_Id; Res : out Result)
-     with Global => (In_Out => Pool),
+     with Global => (In_Out => (Pool, Storage)),
           Pre    => Status (C) in Dead | Suspended,
           Post   => (if Res = Success then not Is_Allocated (C)
                                        and then Status (C) = Dead);
    --  Release C's stack and pool slot. Only legal when C is not active.
 
    procedure Resume (C : Valid_Id; Res : out Result)
-     with Global => (In_Out => (Pool, Current_State)),
+     with Global => (In_Out => (Pool, Current_State),
+                     Input  => Backend),
           Post   => (if Res = Success then Status (C) in Suspended | Dead);
    --  Transfer control into C. Returns when C yields or finishes.
    --
@@ -157,14 +158,16 @@ is
    --  the guard that does the real work look dead to the prover.
 
    procedure Yield (C : Valid_Id; Res : out Result)
-     with Global => (In_Out => (Pool, Current_State)),
+     with Global => (In_Out => (Pool, Current_State),
+                     Input  => Backend),
           Pre    => Status (C) = Running,
           Post   => (if Res = Success then Status (C) = Running);
    --  Suspend C and return control to whoever resumed it. On return -- that
    --  is, once someone has resumed C again -- C is running once more.
 
    procedure Switch_To (Target : Coroutine_Id; Res : out Result)
-     with Global => (In_Out => (Pool, Current_State)),
+     with Global => (In_Out => (Pool, Current_State),
+                     Input  => Backend),
           Post   => (if Res = Success
                      then Running_Coroutine = Running_Coroutine'Old);
    --  Symmetric transfer: save whatever is running and continue Target
@@ -187,7 +190,7 @@ is
    --  overflow and of reads past the written region.
 
    procedure Push (C : Valid_Id; Src : Byte_Array; Res : out Result)
-     with Global => (In_Out => Pool),
+     with Global => (In_Out => Storage, Proof_In => Pool),
           Pre    => Is_Allocated (C),
           Post   =>
             (if Src'Length <= Free_Space (C)'Old then
@@ -198,7 +201,7 @@ is
                  and then Bytes_Stored (C) = Bytes_Stored (C)'Old);
 
    procedure Pop (C : Valid_Id; Dest : out Byte_Array; Res : out Result)
-     with Global => (In_Out => Pool),
+     with Global => (In_Out => Storage, Proof_In => Pool),
           Pre    => Is_Allocated (C),
           Post   =>
             (if Dest'Length <= Bytes_Stored (C)'Old then
@@ -209,7 +212,7 @@ is
                  and then Bytes_Stored (C) = Bytes_Stored (C)'Old);
 
    procedure Peek (C : Valid_Id; Dest : out Byte_Array; Res : out Result)
-     with Global => (Input => Pool),
+     with Global => (Input => Storage, Proof_In => Pool),
           Pre    => Is_Allocated (C),
           Post   => Bytes_Stored (C) = Bytes_Stored (C)'Old
                       and then
