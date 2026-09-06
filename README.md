@@ -77,9 +77,20 @@ code that GNATprove verifies.
 Minicoro                SPARK   coroutine lifecycle, storage API
 Minicoro.Machine_Code   SPARK   x86-64 instruction encoder + switch listing
 Minicoro.FTAL           SPARK   ghost register/stack typing model  (all Ghost)
-Minicoro.Contexts       ——      trusted: calls the generated code
-Minicoro.Code_Page      ——      trusted: W^X page from the OS
+Minicoro.Contexts       SPARK   except the switch itself and its plumbing
+Minicoro.Code_Page      SPARK   W^X page from the OS
 ```
+
+All of `minicoro/` is `SPARK_Mode => On` except six subprograms, each marked
+and justified where it sits: the two `Unchecked_Conversion`s that turn a
+code-page address into a callable switch routine and a coroutine body into a
+machine word, the indirect call itself, `Make_Context`'s overlay write,
+`Adopt_Current`'s volatile stack anchor, `Allocate_Stack`'s `'Address` and
+`Storage_Error` handler, and the `'Access` taken in `Trampoline_Entry`. Those
+are what GNATprove rejects outright — not choices. The layers above
+(`coroutines/`, `generators/`) are `SPARK_Mode => Off` and cannot be
+otherwise: they are built on `Ada.Finalization.Controlled`, which GNATprove
+rejects as such.
 
 At elaboration, `Minicoro.Machine_Code` assembles the switch routine from
 typed instruction encoders; `Minicoro.Code_Page` writes those bytes into a page
@@ -132,9 +143,9 @@ What is proved and what is assumed
 ----------------------------------
 
 Being precise about this matters more than the headline number, which is
-`Success: all checks proved (482 checks)` — 286 run-time checks, 79 functional
-contracts, 18 assertions, 53 termination checks, and the flow analysis, with
-one justification (see below).
+`Success: all checks proved (579 checks)` — 326 run-time checks, 100
+functional contracts, 19 assertions, 65 termination checks, and the flow
+analysis, with two justifications (see below).
 
 **Proved** (GNATprove, `gnatprove -P minicoro.gpr`):
 
@@ -146,8 +157,15 @@ one justification (see below).
   the state-transition guards, and the storage invariant
   `Stored <= Cap` (carried as a predicate on the pool record), which is what
   makes `Push`/`Pop`/`Peek` free of overflow and of reads past written bytes.
+* `Minicoro.Code_Page` — the allocate/write/seal state machine. `Address_At`
+  requires a sealed page and `Write` requires an unsealed one with room for
+  the bytes; both are now discharged by the caller rather than asserted in
+  the body. What is *not* covered is the byte copy itself: it goes through an
+  `Import` overlay at a computed address, which GNATprove models as having no
+  effect (see assumption 6).
+* `Minicoro.Contexts` — everything but the five subprograms named above.
 
-**Assumed.** Three things, each marked in the source:
+**Assumed.** Six things, each marked in the source:
 
 1. **The generated assembly implements `Contexts.Switch`.** SPARK has no
    semantics for machine instructions, so `Switch`'s postcondition is
@@ -162,14 +180,39 @@ one justification (see below).
 3. **Stack disjointness.** `Transfer` assumes distinct pool slots hold
    distinct stack allocations. They do — each is a separate allocation — but
    SPARK cannot see it through the heap.
+4. **`Trampoline`'s precondition.** It states that the handle the generated
+   entry code carries in R13 is the pool index `Create` encoded, that the slot
+   is live, and that its resumer is neither itself nor a released slot.
+   `Create` establishes all three, but nothing in SPARK discharges the
+   precondition: the only reference to `Trampoline` is the `'Access` inside
+   `Trampoline_Entry`, which is outside SPARK, and the only caller is the
+   generated code.
+5. **The OS entry points have no Ada effects.** `mmap`/`mprotect`/`munmap`,
+   and their Win32 counterparts, carry `Global => null`. That is true of the
+   Ada state SPARK reasons about and plainly false of the process; it is
+   written down rather than left as the default GNATprove would assume
+   silently.
+6. **`Code_Page.Write` copies bytes.** GNATprove does not model writes through
+   an overlay at a computed address, and says so — `statement has no effect`,
+   `unused assignment`. It believes `Write` is a no-op. The bytes it writes
+   are checked instead by `test_golden`, which compares the generated listing
+   against a byte-for-byte oracle, and by `test_coro`, which runs it.
 
-There is also exactly one **justified** check, in `Transfer`: SPARK's
-anti-aliasing rule (SPARK RM 6.4.2) is syntactic and treats `Coros (From).Ctx`
-and `Coros (To).Ctx` as possibly the same object, because the indices are not
-static. `Transfer`'s precondition requires `From /= To`, so they are components
-of different array elements. The justification is written out at the call site
-with `pragma Annotate` and shows up in GNATprove's report rather than being
-silently suppressed.
+The **justified** checks are two, both written out with `pragma Annotate` at
+the site and both showing up in GNATprove's report rather than being silently
+suppressed.
+
+In `Transfer`: SPARK's anti-aliasing rule (SPARK RM 6.4.2) is syntactic and
+treats `Coros (From).Ctx` and `Coros (To).Ctx` as possibly the same object,
+because the indices are not static. `Transfer`'s precondition requires
+`From /= To`, so they are components of different array elements.
+
+In `Create`, at the `Allocate_Stack` call: a memory-leak check. The slot was
+chosen because it is not in use, and `Destroy` — the only way a slot becomes
+free — releases the stack before it clears the flag, so a free slot's handle
+owns nothing. SPARK knows `Stack_Handle` is an ownership type but cannot reach
+the pointer inside it from `Minicoro`, and does not track reclamation across
+calls through an array element with a non-static index.
 
 Design notes
 ------------

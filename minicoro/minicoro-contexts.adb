@@ -1,24 +1,79 @@
 --  Copyright (C) 2026, ada-generators contributors
 --  SPDX-License-Identifier: Apache-2.0
 
---  TRUSTED. This body is outside SPARK by necessity: it switches stacks, and
---  no dialect of Ada can describe that. Read it against the contracts in the
---  spec, which say what it is required to establish.
+--  This body is SPARK except for the nested package Machine and the four
+--  subprograms marked SPARK_Mode (Off) below. Those are the trusted base:
+--  they convert between addresses and code pointers, and they call the
+--  generated switch routine, which changes the stack out from under the
+--  caller. No dialect of Ada can describe that.
 
 with Ada.Unchecked_Conversion;
 with Ada.Unchecked_Deallocation;
 
 with Minicoro.Code_Page;
 
-package body Minicoro.Contexts with SPARK_Mode => Off is
-   --  No Refined_State: the body is outside SPARK, so Backend_State stays
-   --  unrefined and opaque, which is exactly what we want here.
+package body Minicoro.Contexts with
+  SPARK_Mode,
+  Refined_State => (Backend_State => (Area, Do_Switch, Wrap_At, Ready))
+is
 
    use type System.Address;
 
+   type Switch_Proc is access procedure (From, To : System.Address)
+     with Convention => C;
+
+   --  The constituents of Backend_State. They are declared here, ahead of
+   --  every body in this package, because a Refined_State constituent must
+   --  precede the first body that freezes the contract.
+
+   Area      : Code_Page.Page;
+   Do_Switch : Switch_Proc    := null;
+   Wrap_At   : System.Address := System.Null_Address;
+   Ready     : Boolean        := False;
+
+   Switch_At : constant Natural := 0;
+
+   --  Guard against the record layout and the generated code disagreeing.
+   --  Both derive from Machine_Code.Layout, so these can only fire if the
+   --  compiler declined the representation clause. They were runtime
+   --  assertions in the package's elaboration part; as compile-time checks
+   --  they say the same thing earlier and leave GNATprove no verification
+   --  condition about 'Size, which it cannot evaluate.
+
+   pragma Compile_Time_Error
+     (Context'Size < Machine_Code.Layout.Win64_Size * 8,
+      "Context is smaller than the buffer the generated code indexes");
+   pragma Compile_Time_Error
+     (Word'Size /= 64, "Context fields must be 64 bits wide");
+
+   -------------
+   -- Machine --
+   -------------
+
+   --  TRUSTED. Everything SPARK cannot express, in one place, so that the
+   --  rest of this body can be analysed. Each operation is small enough to
+   --  read against its declaration.
+
+   package Machine with SPARK_Mode => On is
+
+      function To_Switch (A : System.Address) return Switch_Proc;
+      --  Reinterpret a byte in the sealed code page as the switch routine.
+      --  SPARK forbids Unchecked_Conversion to an access-to-subprogram type:
+      --  it has no way to know the bytes are a subprogram at all.
+
+      function Entry_Word (E : Body_Entry) return Word;
+      --  The address of a coroutine body, as a machine word for the
+      --  generated code to load into R12. SPARK forbids Unchecked_Conversion
+      --  out of a type with access subcomponents.
+
+      procedure Call_Switch (From : in out Context; To : Context);
+      --  Enter the generated routine. This is the one operation in the
+      --  library that does not return to its caller in the ordinary sense.
+
+   end Machine;
+
    function To_Word is new Ada.Unchecked_Conversion (System.Address, Word);
    function To_Addr is new Ada.Unchecked_Conversion (Word, System.Address);
-   function To_Word is new Ada.Unchecked_Conversion (Body_Entry, Word);
 
    procedure Free_Storage is new Ada.Unchecked_Deallocation
      (Stack_Storage, Stack_Storage_Access);
@@ -27,16 +82,27 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
    -- ABI decision --
    ------------------
 
-   function Contains (Haystack, Needle : String) return Boolean;
-   function Detect_ABI return Machine_Code.ABI_Kind;
+   function Contains (Haystack, Needle : String) return Boolean
+     with Global => null;
+   function Detect_ABI return Machine_Code.ABI_Kind
+     with Global => null;
 
    function Contains (Haystack, Needle : String) return Boolean is
    begin
-      if Needle'Length > Haystack'Length then
+      if Needle'Length = 0 then
+         return True;
+      elsif Needle'Length > Haystack'Length then
          return False;
       end if;
-      for I in Haystack'First .. Haystack'Last - Needle'Length + 1 loop
-         if Haystack (I .. I + Needle'Length - 1) = Needle then
+
+      --  The obvious loop bound, Haystack'Last - Needle'Length + 1, is not
+      --  provably in range: nothing stops Haystack'Last from being
+      --  Positive'Last. Running I over the whole string and testing whether
+      --  Needle still fits keeps every intermediate inside Positive.
+      for I in Haystack'First .. Haystack'Last loop
+         if Natural (Haystack'Last - I) + 1 >= Needle'Length
+           and then Haystack (I .. I + (Needle'Length - 1)) = Needle
+         then
             return True;
          end if;
       end loop;
@@ -49,7 +115,7 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
       --  Deciding this at elaboration is sound because the code is generated
       --  at elaboration too: the assembler and its target agree by
       --  construction. It must nonetheless match the calling convention the
-      --  compiler uses for Switch_Proc below, which is why it keys off the
+      --  compiler uses for Switch_Proc above, which is why it keys off the
       --  compiler's own target name.
       if Contains (T, "mingw")
         or else Contains (T, "windows")
@@ -65,24 +131,36 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
 
    function Target_ABI return Machine_Code.ABI_Kind is (ABI);
 
-   --------------------
-   -- Generated code --
-   --------------------
-
-   type Switch_Proc is access procedure (From, To : System.Address)
-     with Convention => C;
-
-   function To_Switch is new Ada.Unchecked_Conversion
-     (System.Address, Switch_Proc);
-
-   Switch_At : constant Natural := 0;
-
-   Area      : Code_Page.Page;
-   Do_Switch : Switch_Proc    := null;
-   Wrap_At   : System.Address := System.Null_Address;
-   Ready     : Boolean        := False;
-
    function Backend_Ready return Boolean is (Ready);
+
+   -------------
+   -- Machine --
+   -------------
+
+   package body Machine with SPARK_Mode => Off is
+
+      function To_Switch_Conv is new Ada.Unchecked_Conversion
+        (System.Address, Switch_Proc);
+
+      function Entry_Conv is new Ada.Unchecked_Conversion (Body_Entry, Word);
+
+      function To_Switch (A : System.Address) return Switch_Proc is
+        (To_Switch_Conv (A));
+
+      function Entry_Word (E : Body_Entry) return Word is (Entry_Conv (E));
+
+      procedure Call_Switch (From : in out Context; To : Context) is
+      begin
+         --  The generated routine saves the live registers into From,
+         --  installs To, and jumps to To.RIP. Control reappears here only
+         --  when some other context switches back into From -- at which
+         --  point From.RIP was the address of the `ret` that
+         --  Machine_Code.Resume_Point_Correct pins down, and that `ret`
+         --  returns to this very call.
+         Do_Switch (From'Address, To'Address);
+      end Call_Switch;
+
+   end Machine;
 
    ------------------------
    -- Initialize_Backend --
@@ -115,7 +193,7 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
          return;
       end if;
 
-      Do_Switch := To_Switch (Code_Page.Address_At (Area, Switch_At));
+      Do_Switch := Machine.To_Switch (Code_Page.Address_At (Area, Switch_At));
       Wrap_At   := Code_Page.Address_At (Area, Wrap_Off);
       Ready     := True;
       Ok        := True;
@@ -154,6 +232,11 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
       S    : out Stack_Handle;
       Ok   : out Boolean)
    is
+      pragma SPARK_Mode (Off);
+      --  Off for two reasons that are the same reason twice: the handler for
+      --  Storage_Error (SPARK does not model allocation failure) and
+      --  'Address on the allocated block (SPARK has no address arithmetic).
+
       --  Round up to a whole number of 16-byte units so that the top of the
       --  stack is 16-aligned, as Make_Context's frame arithmetic assumes.
       Units : constant Stack_Count := ((Size + 15) / 16) * 2;
@@ -190,6 +273,10 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
       Start  : Body_Entry;
       Handle : System.Address)
    is
+      pragma SPARK_Mode (Off);
+      --  Off because of Poison: writing a word at a computed address is an
+      --  overlay SPARK will not model.
+
       --  Win64 requires 32 bytes of shadow space above the frame; System V
       --  requires a 128-byte red zone below it. Both are carved off the top
       --  before anything else, exactly as minicoro does.
@@ -209,10 +296,10 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
    begin
       Poison := 16#DEAD_DEAD_DEAD_DEAD#;
 
-      Ctx.RIP := To_Word (Wrap_At);   --  trampoline
+      Ctx.RIP := To_Word (Wrap_At);          --  trampoline
       Ctx.RSP := SP;
-      Ctx.R12 := To_Word (Start);     --  body, jumped to by the trampoline
-      Ctx.R13 := To_Word (Handle);    --  its argument
+      Ctx.R12 := Machine.Entry_Word (Start); --  body, jumped to by trampoline
+      Ctx.R13 := To_Word (Handle);           --  its argument
 
       Ctx.RBP := 0;
       Ctx.RBX := 0;
@@ -241,6 +328,11 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
    -------------------
 
    procedure Adopt_Current (Ctx : in out Context) is
+      pragma SPARK_Mode (Off);
+      --  Off because the whole point of Anchor is to observe where the
+      --  caller's own stack frame is, and SPARK has neither a volatile local
+      --  nor 'Address to say that with.
+
       Anchor : Word with Volatile;
       --  Its address is on the caller's stack, which is the region being
       --  adopted. We record it only as evidence that the region exists; the
@@ -289,20 +381,12 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
    ------------
 
    procedure Switch (From : in out Context; To : Context) is
+      pragma SPARK_Mode (Off);
+      --  TRUSTED, and irreducibly so. Machine.Call_Switch does not return
+      --  here in the sense SPARK understands "return": it leaves on one stack
+      --  and comes back on another, having run arbitrary code in between.
    begin
-      --  The generated routine saves the live registers into From, installs
-      --  To, and jumps to To.RIP. Control reappears here only when some other
-      --  context switches back into From -- at which point From.RIP was the
-      --  address of the `ret` that Machine_Code.Resume_Point_Correct pins
-      --  down, and that `ret` returns to this very call.
-      Do_Switch (From'Address, To'Address);
+      Machine.Call_Switch (From, To);
    end Switch;
 
-begin
-   --  Guard against the record layout and the generated code disagreeing.
-   --  Both derive from Machine_Code.Layout, so this can only fire if the
-   --  compiler declined the representation clause.
-   pragma Assert (Context'Size >= Machine_Code.Layout.Win64_Size * 8);
-   pragma Assert (Word'Size = 64);
-   null;
 end Minicoro.Contexts;

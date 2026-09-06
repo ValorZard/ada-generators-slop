@@ -5,9 +5,15 @@ with Ada.Finalization;
 
 with Coroutines;
 
+--  NOT SPARK. Generator and Generator_Internal extend
+--  Ada.Finalization.Controlled, which GNATprove rejects outright, and this
+--  package is built on Coroutines, which is out for the same reason plus
+--  four more. Nothing here is individually exotic; the reference-counting
+--  design is simply not expressible in the SPARK subset.
+
 generic
    type T is private;
-package Generators is
+package Generators with SPARK_Mode => Off is
 
    --  This package provides support for creating generators
 

@@ -6,7 +6,7 @@
 with Interfaces.C;
 with System.Storage_Elements;
 
-package body Minicoro.Code_Page with SPARK_Mode => Off is
+package body Minicoro.Code_Page with SPARK_Mode is
 
    use System.Storage_Elements;
    use type Interfaces.C.unsigned;
@@ -23,35 +23,46 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
    PAGE_READWRITE    : constant DWORD := 16#0000_0004#;
    PAGE_EXECUTE_READ : constant DWORD := 16#0000_0020#;
 
+   --  ASSUMPTION. Global => null says these touch no Ada object, which is
+   --  what makes the rest of this package analysable. It is a statement about
+   --  the Ada state SPARK reasons over, not about the process: they plainly
+   --  change the address space. Without it GNATprove assumes the same thing
+   --  silently and says so as a warning on every call.
+
    function VirtualAlloc
      (Addr       : System.Address;
       Size       : SIZE_T;
       Alloc_Type : DWORD;
       Protect    : DWORD) return System.Address
-     with Import, Convention => Stdcall, External_Name => "VirtualAlloc";
+     with Import, Convention => Stdcall, External_Name => "VirtualAlloc",
+          Global => null;
 
    function VirtualFree
      (Addr      : System.Address;
       Size      : SIZE_T;
       Free_Type : DWORD) return BOOL
-     with Import, Convention => Stdcall, External_Name => "VirtualFree";
+     with Import, Convention => Stdcall, External_Name => "VirtualFree",
+          Global => null;
 
    function VirtualProtect
      (Addr        : System.Address;
       Size        : SIZE_T;
       New_Protect : DWORD;
       Old_Protect : access DWORD) return BOOL
-     with Import, Convention => Stdcall, External_Name => "VirtualProtect";
+     with Import, Convention => Stdcall, External_Name => "VirtualProtect",
+          Global => null;
 
    function GetCurrentProcess return System.Address
-     with Import, Convention => Stdcall, External_Name => "GetCurrentProcess";
+     with Import, Convention => Stdcall, External_Name => "GetCurrentProcess",
+          Global => null;
 
    function FlushInstructionCache
      (Process : System.Address;
       Base    : System.Address;
       Size    : SIZE_T) return BOOL
      with Import, Convention => Stdcall,
-          External_Name => "FlushInstructionCache";
+          External_Name => "FlushInstructionCache",
+          Global => null;
 
    --------------
    -- Allocate --
@@ -84,14 +95,10 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
    is
       Target : Storage_Array (1 .. Storage_Offset (Data'Length))
         with Import, Address => P.Base + Storage_Offset (Offset);
-      I : Storage_Offset := 1;
    begin
-      pragma Assert (not P.Sealed);
-      pragma Assert (Offset + Data'Length <= P.Size);
-
-      for B of Data loop
-         Target (I) := Storage_Element (B);
-         I := I + 1;
+      for I in 0 .. Data'Length - 1 loop
+         Target (Storage_Offset (I) + 1) :=
+           Storage_Element (Data (Data'First + I));
       end loop;
    end Write;
 
@@ -101,10 +108,16 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
 
    procedure Seal (P : in out Page; Ok : out Boolean) is
       Old : aliased DWORD := 0;
+
+      Old_Ptr : constant access DWORD := Old'Access;
+      --  Hoisted out of the call below: SPARK does not yet accept 'Access of
+      --  an ownership type anywhere but an assignment, object declaration or
+      --  return statement.
+
+      Prot_Ok : constant BOOL :=
+        VirtualProtect (P.Base, SIZE_T (P.Size), PAGE_EXECUTE_READ, Old_Ptr);
    begin
-      if VirtualProtect
-           (P.Base, SIZE_T (P.Size), PAGE_EXECUTE_READ, Old'Access) = 0
-      then
+      if Prot_Ok = 0 then
          Ok := False;
          return;
       end if;
@@ -125,6 +138,12 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
    ---------------
 
    function Is_Sealed (P : Page) return Boolean is (P.Sealed);
+
+   -------------
+   -- Size_Of --
+   -------------
+
+   function Size_Of (P : Page) return Natural is (P.Size);
 
    ----------------
    -- Address_At --

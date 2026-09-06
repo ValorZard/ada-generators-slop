@@ -10,10 +10,14 @@
 --    * Minicoro                    -- SPARK: coroutine lifecycle and storage
 --    * Minicoro.Machine_Code       -- SPARK: x86-64 instruction encoder
 --    * Minicoro.FTAL               -- SPARK: ghost register/stack typing model
---    * Minicoro.Contexts           -- trusted: context switch (SPARK_Mode Off)
+--    * Minicoro.Contexts           -- SPARK, bar the trusted switch itself
+--    * Minicoro.Code_Page          -- SPARK: W^X page from the OS
 --
---  Everything except Minicoro.Contexts' body is proved by GNATprove. See
---  README.md for what is proved, what is assumed, and why.
+--  Everything is SPARK_Mode On except six subprograms, each marked and
+--  justified in place: Contexts.Machine, Contexts.Allocate_Stack,
+--  Contexts.Make_Context, Contexts.Adopt_Current, Contexts.Switch and
+--  Minicoro.Trampoline_Entry. See README.md for what is proved, what is
+--  assumed, and why.
 
 with System;
 

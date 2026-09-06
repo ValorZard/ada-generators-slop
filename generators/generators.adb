@@ -3,7 +3,7 @@
 
 with Ada.Unchecked_Deallocation;
 
-package body Generators is
+package body Generators with SPARK_Mode => Off is
 
    -------------
    -- Is_Null --

@@ -53,10 +53,29 @@ is
    Backend_Up : Boolean      := False;
 
    procedure Trampoline (Handle : System.Address)
-     with Convention => C;
+     with Convention => C,
+          Pre => Ready
+                   and then To_Integer (Handle) in
+                              Integer_Address (Valid_Id'First)
+                                .. Integer_Address (Valid_Id'Last)
+                   and then Coros (Id_Of (Handle)).In_Use
+                   and then Coros (Id_Of (Handle)).Prev /= Id_Of (Handle)
+                   and then (if Coros (Id_Of (Handle)).Prev /= No_Coroutine
+                             then Coros (Coros (Id_Of (Handle)).Prev).In_Use);
    --  Never returns -- it ends in an unreachable spin -- but it is not marked
    --  No_Return: GNATprove rejects taking 'Access of such a subprogram, and
    --  Make_Context needs its address.
+   --
+   --  ASSUMPTION. Nothing in SPARK discharges this precondition, because
+   --  nothing in SPARK calls Trampoline: the only reference to it is the
+   --  'Access taken in Trampoline_Entry, which is SPARK_Mode Off, and the
+   --  only caller is the generated entry trampoline, which loads Handle from
+   --  R13. So the precondition is not a check but a statement of what
+   --  Make_Context and the generated code owe this subprogram -- Handle is
+   --  the pool index Create encoded, that slot is live, and its resumer is
+   --  neither itself nor a released slot. Create establishes each of those
+   --  before it hands Handle_Of (Slot) to Make_Context. Read it the way the
+   --  contracts on Contexts.Switch are read.
 
    function Ready return Boolean is
      (Backend_Up and then Contexts.Backend_Ready);
@@ -226,6 +245,14 @@ is
 
       Contexts.Allocate_Stack
         (Stack_Count'Max (Stack_Size, Min_Stack_Size), Coros (Slot).Stack, Ok);
+      pragma Annotate
+        (GNATprove, Intentional, "resource or memory leak might occur",
+         "Slot was chosen above because not Coros (Slot).In_Use, and Destroy "
+         & "is the only way a slot becomes free: it calls Free_Stack and only "
+         & "then clears In_Use, so a free slot's handle owns nothing. From "
+         & "here SPARK knows Stack_Handle is an ownership type but cannot "
+         & "reach the pointer inside it, and it does not track reclamation "
+         & "across calls through an array element with a non-static index.");
       if not Ok then
          Res := Out_Of_Memory;
          return;
@@ -412,11 +439,6 @@ is
    ----------------
 
    procedure Trampoline (Handle : System.Address) is
-      pragma SPARK_Mode (Off);
-      --  Off because this subprogram never returns: it runs the user's body
-      --  and then leaves its stack for good. SPARK has no way to describe
-      --  that shape.
-
       C         : constant Valid_Id := Id_Of (Handle);
       Body_Proc : constant Entry_Point := Coros (C).Func;
       Prev      : Coroutine_Id;

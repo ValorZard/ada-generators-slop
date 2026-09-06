@@ -13,7 +13,17 @@ pragma Warnings (Off);
 private with System.Secondary_Stack;
 pragma Warnings (On);
 
-package Coroutines is
+--  NOT SPARK, and not fixable by annotation. Coroutine and
+--  Coroutine_Internal are extensions of Ada.Finalization.Controlled, and
+--  GNATprove rejects those outright: "not allowed in SPARK (due to
+--  controlled types)". Reference counting and the release of the coroutine's
+--  stack are what Initialize/Adjust/Finalize are for, so this is the design,
+--  not an incidental choice. The verified core is Minicoro, below.
+--
+--  Four further constructs in the body would each be a violation on their
+--  own; see the head of coroutines.adb.
+
+package Coroutines with SPARK_Mode => Off is
 
    --  This package provides support for creating coroutines.
 

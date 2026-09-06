@@ -10,13 +10,19 @@ A prototype for Ada generators/coroutines, in four layers, bottom up:
 
 | Directory     | Unit                    | SPARK | Role                                        |
 |---------------|-------------------------|-------|---------------------------------------------|
-| `minicoro/`   | `Minicoro`              | yes   | coroutine lifecycle + per-coroutine byte stack |
+| `minicoro/`   | `Minicoro`              | yes*  | coroutine lifecycle + per-coroutine byte stack |
 |               | `Minicoro.Machine_Code`  | yes   | x86-64 instruction encoder, switch listing  |
 |               | `Minicoro.FTAL`          | yes   | ghost register/stack typing model (all Ghost) |
-|               | `Minicoro.Contexts`      | spec  | **private child**; trusted context switch   |
-|               | `Minicoro.Code_Page`     | no    | W^X page from the OS                        |
+|               | `Minicoro.Contexts`      | yes*  | **private child**; trusted context switch   |
+|               | `Minicoro.Code_Page`     | yes   | W^X page from the OS                        |
 | `coroutines/` | `Coroutines`             | no    | ref-counted, GNAT-runtime-integrated wrapper |
 | `generators/` | `Generators`             | no    | generator API over `Coroutines`             |
+
+`yes*` means the unit is `SPARK_Mode => On` with named exceptions inside it.
+All of `minicoro/` is On except six places, each marked and justified where it
+sits — see "The six things that cannot be SPARK" below. `coroutines/` and
+`generators/` are `SPARK_Mode => Off` and cannot be otherwise: they are built
+on `Ada.Finalization.Controlled`, which GNATprove rejects outright.
 
 `minicoro/` replaced a thin binding to PCL (the old `pcl/` directory, deleted).
 The `generators/` layer was untouched by that swap — the change is confined to
@@ -81,41 +87,125 @@ $HOME/.local/share/alire/toolchains/gprbuild_26.0.1_e3f27f25/bin:$PATH"
 cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail
 ```
 
-Expected: `Success: all checks proved (482 checks)` with **1 justified, 0
+Expected: `Success: all checks proved (579 checks)` with **2 justified, 0
 unproved**. Takes roughly 10-20 minutes — run it in the background, do not
 poll it. `--level=3` also passes; `--report=statistics` if you want per-check
 detail.
+
+The default run is no longer warning-free: `Code_Page` came into SPARK and
+brings six warnings with it, all one fact — GNATprove does not model writes
+through an `Import` overlay at a computed address. See "What `Code_Page` being
+SPARK does and does not buy" below. Nothing else in the default run warns.
 
 `obj/gnatprove/gnatprove.out` holds the summary table; read lines 5-24.
 
 Do not run `gprbuild` and `gnatprove` on `minicoro/` at the same time — they
 share `obj/`. That includes `alr build` and `alr test`, which call `gprbuild`.
 
-The single justification is in `Minicoro.Transfer`: SPARK's anti-aliasing rule
-(RM 6.4.2) is syntactic and treats `Coros (From).Ctx` and `Coros (To).Ctx` as
-possibly the same object because the indices are not static. `Transfer`'s
-precondition requires `From /= To`. Written out with `pragma Annotate` at the
-call site.
+There are two justifications, both written out with `pragma Annotate` at the
+site.
+
+`Minicoro.Transfer`: SPARK's anti-aliasing rule (RM 6.4.2) is syntactic and
+treats `Coros (From).Ctx` and `Coros (To).Ctx` as possibly the same object
+because the indices are not static. `Transfer`'s precondition requires
+`From /= To`.
+
+`Minicoro.Create`, at the `Allocate_Stack` call: a memory-leak check. `Slot`
+was chosen because `not Coros (Slot).In_Use`, and `Destroy` is the only way a
+slot becomes free — it calls `Free_Stack` and only then clears `In_Use`, so a
+free slot's handle owns nothing. SPARK knows `Stack_Handle` is an ownership
+type (its full view became visible when the private part of `Contexts` went
+`SPARK_Mode => On`) but cannot reach the pointer inside it from `Minicoro`,
+and does not track reclamation across calls through an array element with a
+non-static index.
+
+## The six things that cannot be SPARK
+
+Everything in `minicoro/` is `SPARK_Mode => On` except these, and each was
+confirmed against GNATprove rather than assumed. Do not "clean them up" by
+flipping the pragma: the list below is what the tool actually rejects.
+
+1. **`Minicoro.Contexts.Machine`** (body only; the spec is On). Two
+   `Unchecked_Conversion` instances GNATprove refuses — *to* an
+   access-to-subprogram type, to reinterpret sealed code-page bytes as the
+   switch routine, and *from* `Body_Entry`, to take a coroutine body's address
+   as a machine word — plus `Call_Switch`, which is the indirect call into
+   the generated code. This is the irreducible trusted base.
+2. **`Contexts.Switch`** — one line, calling `Machine.Call_Switch`. Off
+   because its postcondition is the trusted claim about the assembly.
+3. **`Contexts.Make_Context`** — writes a poison return address through an
+   overlay at a computed address.
+4. **`Contexts.Adopt_Current`** — a volatile local (SPARK: "effectively
+   volatile object not at library level is not allowed") whose `'Address` is
+   the evidence that the caller's stack region exists.
+5. **`Contexts.Allocate_Stack`** — `'Address` of the allocated block, and a
+   handler for `Storage_Error`, which SPARK does not model.
+6. **`Minicoro.Trampoline_Entry`** — `Trampoline'Access`. "Access to
+   subprogram with global effects is not allowed in SPARK", and the landing
+   pad necessarily touches the pool.
+
+The recurring hard errors behind those, for reference:
+
+- `attribute "Address" outside an attribute definition clause is not allowed
+  in SPARK [E0002]`
+- `unchecked conversion instance to an access to subprogram type` / `from a
+  type with access subcomponents`
+- `access to subprogram with global effects is not allowed in SPARK`
+- `effectively volatile object not at library level [E0001]`
+
+`Minicoro.Trampoline` itself **is** SPARK now. It carries a precondition
+stating what the generated entry code owes it (Handle is the pool index
+`Create` encoded, the slot is live, its resumer is neither itself nor a
+released slot). Nothing discharges that precondition — the only reference to
+`Trampoline` is the `'Access` in `Trampoline_Entry`, which is Off — so read it
+the way `Contexts.Switch`'s contract is read: a statement of an obligation at
+the trusted boundary, not a proved result.
+
+### What `Code_Page` being SPARK does and does not buy
+
+The bookkeeping is genuinely checked: `Size_Of`/`Is_Sealed` are now contracts
+on `Allocate`, `Write`, `Seal` and `Address_At`, so `Initialize_Backend`
+*discharges* `Address_At`'s "the page is sealed" precondition instead of the
+body asserting it. Two `pragma Assert`s that used to sit inside `Write`'s body
+— unchecked claims — are now that subprogram's precondition.
+
+What it does not buy is the byte copy. `Write` writes through an `Import`
+overlay at a computed address, and under `--proof-warnings=on` GNATprove says
+so plainly: `statement has no effect`, `unused assignment`, `"P" is not
+modified, could be IN`. It models `Write` as a no-op. The `[E0012]`
+`imprecise-address-specification` warning is the same limitation stated once.
+So `Code_Page` is analysed for its state machine, not for its effect.
+
+### Why `coroutines/` and `generators/` cannot be SPARK
+
+Not a matter of effort. `Coroutine`, `Coroutine_Internal`, `Generator` and
+`Generator_Internal` all extend `Ada.Finalization.Controlled`, and GNATprove's
+answer to that is flat:
+
+```
+error: "Controlled" is not allowed in SPARK (due to controlled types)
+```
+
+Reference counting and stack release via `Initialize`/`Adjust`/`Finalize` is
+those two layers' design, so this is not fixable by annotation. Three more
+hard rejections sit in `coroutines.adb` on their own account:
+`Coroutine_Wrapper'Access` (global effects), `C'Address` (E0002), and
+`System.Address_To_Access_Conversions.To_Pointer`, which SPARK models as an
+allocating function returning an owning pointer.
+
+Two things that are *not* the reason, contrary to expectation:
+`Ada.Exceptions.Save_Occurrence`/`Reraise_Occurrence` are legal SPARK, and so
+is an `exception when others` handler. Both were checked in isolation.
+
+Both packages now carry an explicit `SPARK_Mode => Off` with the reason in a
+header comment, so the status is declared rather than merely defaulted.
 
 ## Proof warnings: where this stands (2026-09-06)
 
-**Status: the default proof run is clean. The extended run is not, and the
-work to clean it is unfinished.** Read this before touching `Resume`, `Yield`,
-`Switch_To` or `Transfer`.
-
-### Done
-
-`minicoro-code_page__posix.adb` no longer spells `MAP_FAILED` as
-`System'To_Address (-1)`. `Integer_Address` is modular (`mod Memory_Size`, see
-`s-stoele.ads`), so a negative literal is out of range and GNATprove's
-frontend reported "value not in range ... Constraint_Error will be raised at
-run time" — on the success path of *every* `Allocate`. GNAT folds the static
-attribute and the code always worked, but the warning was real noise. It is
-now `To_Address (Integer_Address'Last)`, which is the same all-ones address
-said in a way both tools accept. The default run emits **zero** warnings.
-
-This fix is *uncommitted* at the time of writing; everything else described
-below is unstarted.
+**Status: all checks prove, in both the default and the extended run. The
+`pragma Assume is always False` family below is a real defect and is still
+open.** Read this before touching `Resume`, `Yield`, `Switch_To` or
+`Transfer`.
 
 ### The extended run
 
@@ -126,14 +216,24 @@ cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail \
   --pedantic --proof-warnings=on
 ```
 
-Still `Success: all checks proved (482 checks)`, but **20 warnings**. They
-fall into three groups, and the middle one is the only one that matters.
+Still `Success: all checks proved (579 checks)`, but **29 warnings**:
+
+| Count | Kind                                    | Group |
+|-------|-----------------------------------------|-------|
+| 11    | `operator-reassociation`                | 2     |
+| 5     | `pragma Assume is always False`         | 1     |
+| 3     | `unreachable branch`                    | 1     |
+| 2     | `unreachable code`                      | 1, 4  |
+| 7     | `Code_Page` overlay family              | 3     |
+| 1     | `representation-attribute-value`        | 5     |
+
+Group 1 is the only one with verification consequences.
 
 ### 1. `pragma Assume is always False` — a real defect, unfixed
 
-Five warnings (`minicoro.adb:321,322,367,368,405`) plus four
+Five warnings (`minicoro.adb:348,349,394,395,432`) plus four
 `unreachable branch`/`unreachable code` ones
-(`minicoro.ads:151,157,164`, `minicoro.adb:289`). All but the last share one
+(`minicoro.ads:155,161,168`, `minicoro.adb:316`). All but the last share one
 root cause.
 
 `Transfer` never assigns `Current`, so SPARK's inferred `Global` for it does
@@ -151,11 +251,11 @@ The assumption contradicts what the prover derived. **A contradictory
 `pragma Assume` makes everything after it vacuously provable** — which is why
 the postconditions of `Resume`, `Yield` and `Switch_To` are reported as
 unreachable branches. Those three postconditions are *not actually verified
-today*. The 482 figure is not wrong, but it counts three vacuous contracts.
+today*. The 579 figure is not wrong, but it counts three vacuous contracts.
 
 `Yield` (`Current := Prev` then `Assume (Current = C)`) and `Switch_To`
 (`Current := Target` then `Assume (Current = Cur)`) fail the same way. The
-second assume in each pair (`321`/`322`, `367`/`368`) is flagged only because
+second assume in each pair (`348`/`349`, `394`/`395`) is flagged only because
 it sits downstream of the first — fix the first and the second should go
 quiet on its own.
 
@@ -185,7 +285,7 @@ almost nothing after `Transfer` (they assign `Res` and return), so the blast
 radius *looks* small — but `Trampoline` also calls `Transfer`
 (`minicoro.adb:437`) and was not analysed. Budget a few proof cycles.
 
-`minicoro.adb:289` (`Res := Not_Suspended`) is separate and is **not a bug**:
+`minicoro.adb:316` (`Res := Not_Suspended`) is separate and is **not a bug**:
 `Resume`'s precondition is `Status (C) = Suspended`, so the guard is dead for
 SPARK-proved callers. It stays — `Coroutines` is not SPARK and can violate
 that precondition. If the warning needs silencing, justify it in place rather
@@ -199,7 +299,7 @@ same-precedence predefined operators, so `A + B + C` may be evaluated as
 if an intermediate overflows, and none of these can — they are byte-range
 encoder arithmetic and small index sums.
 
-Sites: `minicoro.adb:461,486,512` (`Base + 1 + (I - Src'First)`),
+Sites: `minicoro.adb:483,508,534` (`Base + 1 + (I - Src'First)`),
 `minicoro-machine_code.adb:24` (`REX`), `:31` (`Mod_RM`), `:63` (`Put_Disp`'s
 precondition), `:178`, `:203`, `:243` (`P + 3 + Disp_Size (M)`),
 `minicoro-machine_code.ads:148` (`Subprogram_Variant`), `:238`
@@ -212,23 +312,61 @@ and safe. It was drafted and pulled back before landing; `REX` and
 four and five terms. Decide whether pinning the association is worth the
 noise before redoing it.
 
-### 3. `info:` lines are not warnings
+### 3. The `Code_Page` overlay family — 7 warnings, one fact
 
-`cannot unroll loop (too many loop iterations)` at `minicoro.adb:215,511` and
-`unrolling loop` at `minicoro-machine_code.adb:333`. Informational; the loops
-carry invariants and prove fine. Nothing to do.
+`minicoro-code_page.ads:40,64` and `minicoro-code_page__posix.adb:109,110,112,
+113,159`: `statement has no effect`, `unused assignment`, `unused initial
+value of "P"`, `"P" is not modified, could be IN`, and one `[E0012]`
+`imprecise-address-specification`. They are all the same thing said seven
+ways — GNATprove does not model a write through an `Import` overlay at a
+computed address, so it believes `Write` does nothing and `Free` changes
+nothing. Seven of these appear in the **default** run too. Nothing to fix;
+the limitation is real and is recorded under "What `Code_Page` being SPARK
+does and does not buy".
+
+### 4. `unreachable code` at `minicoro-code_page__posix.adb:74` — prover and
+compiler disagree about the target
+
+GNATprove proves the `return True` inside `On_Linux` unreachable, i.e. that
+`Standard'Target_Name` never contains "linux". The compiler disagrees: on this
+machine `Standard'Target_Name` is `"x86_64-pc-linux-gnu"` (19 chars, "linux"
+at index 11), GNAT folds the search accordingly, and the 27-case suite passes
+— which it could not if `MAP_ANONYMOUS` came out as the BSD `0x1000` instead
+of Linux's `0x20`, because `mmap` would fail and `Create` would return
+`Make_Context_Error`.
+
+So this is a false report, and the interesting part is *why*: GNATprove's
+frontend evidently does not see the same `Standard'Target_Name` the compiler
+does. Harmless here because the value is only used to pick a constant, but
+worth remembering before making anything load-bearing depend on
+`Standard'Target_Name` under proof — `Contexts.Detect_ABI` does exactly that.
+
+### 5. `representation-attribute-value` at `minicoro-contexts.adb:44`
+
+`--pedantic` only, and a deliberate trade. The layout guard used to be a
+runtime `pragma Assert (Context'Size >= Machine_Code.Layout.Win64_Size * 8)`
+in the package's elaboration part, which GNATprove could not prove (it cannot
+evaluate `'Size`) and reported as `medium: assertion might fail`. It is now a
+`pragma Compile_Time_Error`, so the compiler checks it and GNATprove
+generates no verification condition — it only notes, correctly, that `'Size`
+is implementation-defined.
+
+### 6. `info:` lines are not warnings
+
+`cannot unroll loop (too many loop iterations)` and `unrolling loop`.
+Informational; the loops carry invariants and prove fine. Nothing to do.
 
 ### Resuming
 
-1. Commit or re-apply the `MAP_FAILED` fix.
-2. Re-run the extended command above to confirm the 20 warnings still stand.
-3. Do family 1 first — it is the only one with verification consequences.
+1. Re-run the extended command above to confirm the 29 warnings still stand.
+2. Do family 1 first — it is the only one with verification consequences.
    After it lands, re-check that `Resume`/`Yield`/`Switch_To` postconditions
    are genuinely proved (they should stop being reported as unreachable
    branches) and re-run `alr test`: these are the coroutine lifecycle paths,
    so the 27-case suite is the check that the model change did not alter
    behaviour.
-4. Family 2 is independent and can be skipped or done at leisure.
+3. Family 2 is independent and can be skipped or done at leisure. Families
+   3, 4 and 5 are tool limitations or deliberate trades, not work items.
 
 ## Traps that cost time
 
@@ -331,9 +469,11 @@ hand-written byte table anywhere in `minicoro/` — the only byte table is
 ## What is proved vs assumed
 
 Proved: all of `Machine_Code` (including `Resume_Point_Correct` and the
-displacement round trip), and `Minicoro`'s absence of runtime errors, state
-guards and the storage invariant `Stored <= Cap` (a `Dynamic_Predicate` on
-`Coroutine_Record`).
+displacement round trip), `Minicoro`'s absence of runtime errors, state guards
+and the storage invariant `Stored <= Cap` (a `Dynamic_Predicate` on
+`Coroutine_Record`), `Code_Page`'s allocate/write/seal state machine, and
+everything in `Contexts` but the five subprograms listed under "The six things
+that cannot be SPARK".
 
 Assumed, each marked in the source with its reasoning:
 1. The generated assembly implements `Contexts.Switch`'s contract. SPARK has no
@@ -351,6 +491,20 @@ Assumed, each marked in the source with its reasoning:
    fix is drafted under "Proof warnings: where this stands". Until then,
    read those three contracts as claims, not results.
 3. Stack disjointness across separate heap allocations.
+4. **`Trampoline`'s precondition.** It says Handle is the pool index `Create`
+   encoded, that the slot is live, and that its resumer is neither itself nor
+   a released slot. `Create` establishes all three before handing
+   `Handle_Of (Slot)` to `Make_Context`, but nothing in SPARK discharges it:
+   the only reference to `Trampoline` is the `'Access` inside
+   `Trampoline_Entry`, which is `SPARK_Mode (Off)`, and the only caller is the
+   generated entry code.
+5. **The OS entry points have no Ada effects.** `mmap`/`mprotect`/`munmap`
+   (and their Win32 counterparts) carry `Global => null`. True of the Ada
+   state SPARK reasons over, plainly false of the process. Stated explicitly
+   rather than left as the silent default GNATprove would otherwise assume.
+6. **`Code_Page.Write` actually copies bytes.** GNATprove models the overlay
+   write as having no effect and says so; see "What `Code_Page` being SPARK
+   does and does not buy".
 
 If you touch `Resume`/`Yield`/`Switch_To`/`Trampoline`, re-check that the
 assumptions still match what the counterpart routine actually restores. They
@@ -408,9 +562,13 @@ destroyed while the coroutine ran.
   with the System V switch routine. macOS and the BSDs are still untested —
   `MAP_ANONYMOUS` differs there and `On_Linux` picks the value by inspecting
   `Standard'Target_Name`.
-- Twenty warnings remain under `--pedantic --proof-warnings=on` (9 in the
-  assume/unreachable family, 11 reassociation), and three postconditions are
-  vacuously proved because of them. See "Proof warnings: where this stands"
-  above — that is the open work.
+- The `pragma Assume is always False` family is still open, so three
+  postconditions (`Resume`, `Yield`, `Switch_To`) are still vacuously proved.
+  See "Proof warnings: where this stands" — that is the open work, and it is
+  unaffected by the SPARK_Mode expansion.
+- `coroutines/` and `generators/` are `SPARK_Mode => Off` and staying that
+  way; putting them in SPARK means replacing `Ada.Finalization.Controlled`
+  ref-counting with something SPARK accepts, which is a rewrite of both
+  layers, not an annotation exercise.
 - The user pushes to their own fork
   (`https://github.com/ValorZard/ada-generators-slop.git`) themselves.

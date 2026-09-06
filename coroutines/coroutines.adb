@@ -14,7 +14,25 @@ with System.Parameters;
 with System.Soft_Links;
 pragma Warnings (On);
 
-package body Coroutines is
+--  NOT SPARK. Beyond the controlled types named in the spec, this body uses
+--  four constructs GNATprove rejects outright:
+--
+--    * Coroutine_Wrapper'Access -- "access to subprogram with global effects
+--      is not allowed in SPARK". The wrapper is the landing pad for a new
+--      coroutine and necessarily touches Previous_Coroutine.
+--    * System.Address_To_Access_Conversions.To_Pointer, to recover the
+--      Coroutine_Internal from the handle Minicoro carried across the switch
+--      -- SPARK models it as an allocating function returning an owning
+--      pointer, which is the wrong ownership story entirely.
+--    * C'Address, to hand that handle over in the first place -- 'Address
+--      outside an attribute definition clause is not in SPARK.
+--    * Unchecked_Conversion from System.Address to an access-to-tagged type,
+--      in Get_Coroutine.
+--
+--  Save_Occurrence and Reraise_Occurrence are, perhaps surprisingly, legal
+--  SPARK; they are not why this package is out.
+
+package body Coroutines with SPARK_Mode => Off is
 
    use type System.Secondary_Stack.SS_Stack_Ptr;
    use type Minicoro.Coroutine_Id;

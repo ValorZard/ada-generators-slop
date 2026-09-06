@@ -3,12 +3,13 @@
 
 --  The trusted base: saved machine contexts and the switch between them.
 --
---  This spec is SPARK; the body is not, and cannot be. Switching stacks is
---  not expressible in Ada's semantics, let alone SPARK's. What this package
---  does instead is state, in the contracts below, exactly what the trusted
---  code promises -- using the ghost model in Minicoro.FTAL -- so that every
---  caller's obligations are checked by GNATprove even though the callee's
---  are not.
+--  This spec is SPARK, and so is all of the body except the handful of
+--  operations listed at the top of minicoro-contexts.adb. Switching stacks
+--  is not expressible in Ada's semantics, let alone SPARK's. What this
+--  package does instead is state, in the contracts below, exactly what the
+--  trusted code promises -- using the ghost model in Minicoro.FTAL -- so
+--  that every caller's obligations are checked by GNATprove even though the
+--  callee's are not.
 --
 --  The machine code itself is not written here. It is generated at
 --  elaboration by Minicoro.Machine_Code, which is proved, and installed into
@@ -48,9 +49,10 @@ is
    -- Ghost model  --
    ------------------
 
-   --  These have no bodies in SPARK. They are uninterpreted: everything a
-   --  caller knows about them comes from the contracts below, which is
-   --  precisely the trusted interface.
+   --  Expression functions over the private view, so the prover can see
+   --  what they mean. Callers outside this package still learn nothing but
+   --  what the contracts below say, because the private part is not
+   --  visible to them -- that is the trusted interface.
 
    function Model (C : Context) return FTAL.Context_Model
      with Ghost, Global => null;
@@ -74,9 +76,11 @@ is
    --  before any other operation here is called.
 
    function Target_ABI return Machine_Code.ABI_Kind
-     with Global => (Input => Backend_State);
+     with Global => null;
    --  Which ABI this process is running under. Decided at elaboration from
    --  the target name, which is sound because the code is generated then too.
+   --  Global is null rather than Backend_State: the answer is fixed before
+   --  the backend comes up and does not depend on whether it did.
 
    ------------
    -- Stacks --
@@ -146,7 +150,6 @@ is
    --  proved -- see README.md.
 
 private
-   pragma SPARK_Mode (Off);
 
    use type Machine_Code.ABI_Kind;
 

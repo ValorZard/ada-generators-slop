@@ -6,7 +6,7 @@
 with Interfaces.C;
 with System.Storage_Elements;
 
-package body Minicoro.Code_Page with SPARK_Mode => Off is
+package body Minicoro.Code_Page with SPARK_Mode is
 
    use System.Storage_Elements;
    use type Interfaces.C.int;
@@ -21,7 +21,7 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
 
    MAP_PRIVATE : constant C_Int := 16#02#;
 
-   function On_Linux return Boolean;
+   function On_Linux return Boolean with Global => null;
 
    function MAP_ANONYMOUS return C_Int is
      (if On_Linux then 16#20# else 16#1000#);
@@ -37,6 +37,12 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
    --  GNATprove's frontend reports it as a Constraint_Error that will be
    --  raised at run time -- on the success path of every Allocate.
 
+   --  ASSUMPTION. Global => null says these three touch no Ada object, which
+   --  is what makes the rest of this package analysable. It is a statement
+   --  about the Ada state SPARK reasons over, not about the process: they
+   --  plainly change the address space. Without it GNATprove assumes the same
+   --  thing silently and says so as a warning on every call.
+
    function mmap
      (Addr   : System.Address;
       Length : Size_T;
@@ -44,14 +50,17 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
       Flags  : C_Int;
       Fd     : C_Int;
       Offset : Long_Integer) return System.Address
-     with Import, Convention => C, External_Name => "mmap";
+     with Import, Convention => C, External_Name => "mmap",
+          Global => null;
 
    function munmap (Addr : System.Address; Length : Size_T) return C_Int
-     with Import, Convention => C, External_Name => "munmap";
+     with Import, Convention => C, External_Name => "munmap",
+          Global => null;
 
    function mprotect
      (Addr : System.Address; Length : Size_T; Prot : C_Int) return C_Int
-     with Import, Convention => C, External_Name => "mprotect";
+     with Import, Convention => C, External_Name => "mprotect",
+          Global => null;
 
    --------------
    -- On_Linux --
@@ -99,14 +108,10 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
    is
       Target : Storage_Array (1 .. Storage_Offset (Data'Length))
         with Import, Address => P.Base + Storage_Offset (Offset);
-      I : Storage_Offset := 1;
    begin
-      pragma Assert (not P.Sealed);
-      pragma Assert (Offset + Data'Length <= P.Size);
-
-      for B of Data loop
-         Target (I) := Storage_Element (B);
-         I := I + 1;
+      for I in 0 .. Data'Length - 1 loop
+         Target (Storage_Offset (I) + 1) :=
+           Storage_Element (Data (Data'First + I));
       end loop;
    end Write;
 
@@ -130,6 +135,12 @@ package body Minicoro.Code_Page with SPARK_Mode => Off is
    ---------------
 
    function Is_Sealed (P : Page) return Boolean is (P.Sealed);
+
+   -------------
+   -- Size_Of --
+   -------------
+
+   function Size_Of (P : Page) return Natural is (P.Size);
 
    ----------------
    -- Address_At --
