@@ -35,7 +35,7 @@ is
       Ctx   : Contexts.Context;
       Stack : Contexts.Stack_Handle;
 
-      Store  : Store_Buffer  := (others => 0);
+      Store  : Store_Buffer  := [others => 0];
       Stored : Storage_Count := 0;
       Cap    : Storage_Count := 0;
    end record
@@ -474,7 +474,7 @@ is
    procedure Pop (C : Valid_Id; Dest : out Byte_Array; Res : out Result) is
    begin
       if Dest'Length > Coros (C).Stored then
-         Dest := (others => 0);
+         Dest := [others => 0];
          Res  := Not_Enough_Space;
          return;
       end if;
@@ -500,7 +500,7 @@ is
    procedure Peek (C : Valid_Id; Dest : out Byte_Array; Res : out Result) is
    begin
       if Dest'Length > Coros (C).Stored then
-         Dest := (others => 0);
+         Dest := [others => 0];
          Res  := Not_Enough_Space;
          return;
       end if;

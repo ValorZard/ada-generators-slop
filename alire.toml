@@ -1,0 +1,35 @@
+name = "ada_generators"
+description = "Generators and coroutines for Ada on a SPARK-proved x86-64 backend"
+version = "0.1.0-dev"
+
+authors = ["Pierre-Marie de Rodat", "ada-generators contributors"]
+maintainers = ["Srayan Jana <srayan.jana@outlook.com>"]
+maintainers-logins = ["ValorZard"]
+licenses = "Apache-2.0"
+website = "https://github.com/ValorZard/ada-generators-slop"
+tags = ["coroutines", "generators", "spark", "ada2022"]
+
+#  The three layers, bottom up, then their testsuites. `alr build` builds all
+#  six; the library projects come first so the tests never trigger a rebuild.
+project-files = [
+   "minicoro/minicoro.gpr",
+   "coroutines/coroutines.gpr",
+   "generators/generators.gpr",
+   "minicoro/tests/tests.gpr",
+   "coroutines/tests/tests.gpr",
+   "generators/tests/tests.gpr",
+]
+
+#  The projects find each other by name (`with "minicoro.gpr"`), so their
+#  directories have to be on GPR_PROJECT_PATH. Alire sets this for us, which
+#  is the whole reason the manual export in README.md is no longer needed.
+[environment]
+GPR_PROJECT_PATH.prepend = "${CRATE_ROOT}/minicoro:${CRATE_ROOT}/coroutines:${CRATE_ROOT}/generators"
+
+[[depends-on]]
+gnat = ">=13"
+
+#  `alr test` builds everything and then runs the three testsuites.
+[[actions]]
+type = "test"
+command = ["python3", "run_tests.py"]

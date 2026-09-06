@@ -38,7 +38,7 @@ package body Coro_Demo is
       --  A nested coroutine: resumed from inside Producer, so yielding must
       --  return to Producer and not to the main context.
       for I in 1 .. 3 loop
-         Minicoro.Push (Self, (1 => Minicoro.Byte (100 + I)), Pushed);
+         Minicoro.Push (Self, [1 => Minicoro.Byte (100 + I)], Pushed);
          pragma Assert (Pushed = Minicoro.Success);
          Minicoro.Yield (Self, Yielded);
          pragma Assert (Yielded = Minicoro.Success);
@@ -50,7 +50,7 @@ package body Coro_Demo is
       Buf : Minicoro.Byte_Array (1 .. 1);
    begin
       for I in 1 .. 5 loop
-         Minicoro.Push (Self, (1 => Minicoro.Byte (I)), Res);
+         Minicoro.Push (Self, [1 => Minicoro.Byte (I)], Res);
          pragma Assert (Res = Minicoro.Success);
          Minicoro.Yield (Self, Res);
          pragma Assert (Res = Minicoro.Success);
@@ -115,7 +115,7 @@ package body Coro_Demo is
       --  leave the buffer alone.
       declare
          Big : constant Minicoro.Byte_Array (1 .. Minicoro.Max_Storage + 1) :=
-           (others => 0);
+           [others => 0];
          C2  : Minicoro.Coroutine_Id;
       begin
          Minicoro.Create (C2, Counter'Access, Res => Res);

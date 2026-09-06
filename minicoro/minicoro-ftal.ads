@@ -115,7 +115,7 @@ package Minicoro.FTAL with SPARK_Mode, Ghost is
    end record;
 
    Unmade : constant Context_Model :=
-     (Regs  => (others => Junk),
+     (Regs  => [others => Junk],
       SP    => 0,
       PC    => 0,
       Stack => Null_Region,

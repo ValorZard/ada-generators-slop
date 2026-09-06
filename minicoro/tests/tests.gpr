@@ -14,6 +14,6 @@ project Tests is
       "dump_code.adb");      --  developer aid: hex dump of what we generate
 
    package Compiler is
-      for Default_Switches ("Ada") use ("-gnat12", "-gnatwae", "-gnatyg");
+      for Default_Switches ("Ada") use ("-gnat2022", "-gnatwae", "-gnatyg");
    end Compiler;
 end Tests;

@@ -161,7 +161,7 @@ private
    type Context is limited record
       RIP, RSP, RBP, RBX, R12, R13, R14, R15 : Word := 0;
       RDI, RSI                               : Word := 0;
-      XMM                                    : XMM_Save := (others => 0);
+      XMM                                    : XMM_Save := [others => 0];
       Fiber_Storage                          : Word := 0;
       Dealloc_Stack                          : Word := 0;
       Stack_Limit                            : Word := 0;

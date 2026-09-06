@@ -134,10 +134,10 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
 
    function Model (C : Context) return FTAL.Context_Model is
      ((Regs  =>
-         (FTAL.RIP => (if C.Made then FTAL.Code_Pointer else FTAL.Junk),
+         [FTAL.RIP => (if C.Made then FTAL.Code_Pointer else FTAL.Junk),
           FTAL.RSP => (if C.Made then FTAL.Stack_Pointer else FTAL.Junk),
           FTAL.R13 => (if C.Made then FTAL.Handle else FTAL.Junk),
-          others   => FTAL.Scalar),
+          others   => FTAL.Scalar],
        SP    => FTAL.Word (C.RSP),
        PC    => FTAL.Word (C.RIP),
        Stack => (Base    => FTAL.Word (C.Region_Base),
@@ -220,7 +220,7 @@ package body Minicoro.Contexts with SPARK_Mode => Off is
       Ctx.R15 := 0;
       Ctx.RDI := 0;
       Ctx.RSI := 0;
-      Ctx.XMM := (others => 0);
+      Ctx.XMM := [others => 0];
 
       --  Win64 keeps the running stack's bounds in the Thread Environment
       --  Block; the switch routine swaps them, so they must describe this

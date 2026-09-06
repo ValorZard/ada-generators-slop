@@ -320,7 +320,7 @@ package body Minicoro.Machine_Code with SPARK_Mode is
 
    function Assemble (L : Listing) return Code is
       Size   : constant Natural := Total_Length (L);
-      Result : Code (1 .. Size) := (others => 16#90#);
+      Result : Code (1 .. Size) := [others => 16#90#];
       Pos    : Natural := 0;
    begin
       for I in L'Range loop
@@ -364,7 +364,7 @@ package body Minicoro.Machine_Code with SPARK_Mode is
    function Win64_Template return Insn_Array is
       From : constant Base_Reg := RCX;   --  first argument
       To   : constant Base_Reg := RDX;   --  second argument
-      L    : Insn_Array (1 .. Win64_Ret) := (others => Nop);
+      L    : Insn_Array (1 .. Win64_Ret) := [others => Nop];
    begin
       --  Record the resume point. The displacement is patched in later by
       --  Switch_Code; only the length matters for layout, and Lea_RIP pins
@@ -460,7 +460,7 @@ package body Minicoro.Machine_Code with SPARK_Mode is
    function SysV_Template return Insn_Array is
       From : constant Base_Reg := RDI;   --  first argument
       To   : constant Base_Reg := RSI;   --  second argument
-      L    : Insn_Array (1 .. SysV_Ret) := (others => Nop);
+      L    : Insn_Array (1 .. SysV_Ret) := [others => Nop];
    begin
       L (1) := Lea_RIP (RAX, 0);
       L (2) := Mov_Store (From, Layout.RIP, RAX);
@@ -542,9 +542,9 @@ package body Minicoro.Machine_Code with SPARK_Mode is
       --  register and tail-jump into the body.
       Arg0 : constant GP_Reg := (if ABI = Win64 then RCX else RDI);
       L    : constant Insn_Array (1 .. 3) :=
-        (1 => Mov_Reg (Arg0, R13),
+        [1 => Mov_Reg (Arg0, R13),
          2 => Jmp_Reg (R12),
-         3 => Ret);            --  unreachable; keeps the block well-formed
+         3 => Ret];            --  unreachable; keeps the block well-formed
    begin
       return Assemble (L);
    end Wrap_Main_Code;

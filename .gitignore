@@ -1,5 +1,13 @@
+#  Build output. Each layer builds into its own obj/, the testsuites into
+#  exe/; run.py writes tmp.out.
 obj/
 exe/
 tmp.out
 *.ali
 *.exe
+
+#  Alire workspace state. alire/ holds the resolved dependency cache and the
+#  test logs; config/ is the crate configuration Alire generates.
+/alire/
+/config/
+alire.lock

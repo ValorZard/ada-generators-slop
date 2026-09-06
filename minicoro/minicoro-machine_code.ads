@@ -34,7 +34,7 @@ package Minicoro.Machine_Code with SPARK_Mode is
 
    type Insn is record
       Length : Insn_Length := 1;
-      Bytes  : Insn_Bytes  := (others => 16#90#);  --  nop
+      Bytes  : Insn_Bytes  := [others => 16#90#];  --  nop
    end record;
 
    --  Listings and code blocks are bounded. Without an upper bound on the

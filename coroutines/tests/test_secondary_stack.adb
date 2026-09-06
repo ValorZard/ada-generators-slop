@@ -24,7 +24,7 @@ procedure Test_Secondary_Stack is
 
    function Letters (N : Natural; C : Character) return String is
    begin
-      return (1 .. N => C);
+      return [1 .. N => C];
    end Letters;
 
    ---------

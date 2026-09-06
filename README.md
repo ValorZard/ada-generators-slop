@@ -1,4 +1,4 @@
-Ada 2020 - Generators/Coroutines prototype
+Ada 2022 - Generators/Coroutines prototype
 ==========================================
 
 This repository hosts a prototype for generators/coroutines support in Ada.
@@ -13,16 +13,28 @@ This prototype includes:
 Requirements
 ------------
 
-A GNAT toolchain. There is **no external library to install** — the previous
-dependency on PCL (Portable Coroutine Library) is gone, and with it the
-requirement to have a C library and its headers available.
+[Alire](https://alire.ada.dev/) and a GNAT toolchain it can fetch. There is
+**no external library to install** — the previous dependency on PCL (Portable
+Coroutine Library) is gone, and with it the requirement to have a C library
+and its headers available.
 
-To build, make the `*.gpr` files visible to GPRbuild by adding their
-directories to `GPR_PROJECT_PATH`.
+The tree is one Alire crate, described by the `alire.toml` at the root. Alire
+puts the three layers on `GPR_PROJECT_PATH` so they can find each other, so
+there is nothing to export by hand:
 
-To run the proofs you additionally need GNATprove; `alr toolchain` will fetch
-both. This tree was developed against GNAT 15.2 and GNATprove FSF 16.1
-(Alt-Ergo 2.6.1, cvc5 1.3.2, Z3 4.15.4).
+```sh
+$ alr toolchain --select     # once, to pick a GNAT
+$ alr build
+```
+
+The sources are Ada 2022 (`-gnat2022`), built with `-gnatwae -gnatyg`:
+warnings are errors and GNAT style is enforced. Developed against GNAT 16.1
+and GNATprove FSF 16.1 (Alt-Ergo 2.6.1, cvc5 1.3.2, Z3 4.15.4).
+
+To run the proofs you additionally need GNATprove. It is deliberately *not* a
+dependency of the crate — proving is a maintainer activity, not part of
+building — so fetch it separately (`alr get gnatprove`, or your distribution's
+package) and put it on `PATH`. See `CLAUDE.md` for the exact invocation.
 
 Usage
 -----
@@ -31,18 +43,28 @@ This is only a prototype so there is no documentation yet! That being said, if
 you want to use this prototype, take a look at the `coroutines/tests` and
 `generators/tests` subdirectories: in particular all the `.adb` source files.
 
-If you want to run a testsuite, go to the relevant `tests` directory, build the
-testcases and run the driver:
+All three testsuites run from the repository root:
 
 ```sh
-$ gprbuild -Ptests
-$ python run.py
+$ alr test
 ```
 
-`minicoro/tests` builds two checks of its own: `test_golden`, which compares
+That builds everything and then runs `run_tests.py`, which reports one verdict
+per case — 27 in total: 2 in `minicoro/tests`, 17 in `coroutines/tests` and 8
+in `generators/tests`. `alr` writes the report to
+`alire/alr_test_local.log`; run `python3 run_tests.py` directly to watch it
+live.
+
+The `coroutines` and `generators` cases are golden-output tests, compared
+against the matching file in the suite's `ref/` directory. Output is
+normalised to LF first: the reference files have LF endings and the
+executables emit CRLF on Windows, so a raw byte comparison there reports every
+case as a difference and tells you nothing. (The older per-suite `run.py`
+drivers still exist and still compare raw bytes.)
+
+`minicoro/tests` is self-checking rather than golden: `test_golden` compares
 the generated machine code against minicoro's published byte tables, and
-`test_coro`, which exercises create/resume/yield/storage including nested
-coroutines.
+`test_coro` exercises create/resume/yield/storage including nested coroutines.
 
 The coroutine backend
 ---------------------

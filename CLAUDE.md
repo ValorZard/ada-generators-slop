@@ -24,56 +24,60 @@ The `generators/` layer was untouched by that swap — the change is confined to
 
 ## Toolchain
 
-Nothing is on `PATH` by default. Everything comes from Alire's cache. Source
-this before any build/prove command:
+The tree is a single Alire crate (`alire.toml` at the root) and everything
+goes through `alr`, which is the only thing that has to be on `PATH`:
 
 ```sh
-export GNAT_ROOT="$LOCALAPPDATA/alire/cache/toolchains/gnat_native_15.2.1_346e2e00"
-export GPR_ROOT="$LOCALAPPDATA/alire/cache/toolchains/gprbuild_25.0.1_1bcdf5e8"
-export SPARK_ROOT="$LOCALAPPDATA/alire/cache/releases/gnatprove_16.1.0_f3c62ad9"
-export PATH="$GNAT_ROOT/bin:$GPR_ROOT/bin:$SPARK_ROOT/bin:$PATH"
+export PATH="$HOME/alire/bin:$PATH"
 ```
 
-- GNAT 15.2.0 (`x86_64-w64-mingw32`), GPRBUILD 25.0.0, GNATprove FSF 16.1.0
-  with Alt-Ergo 2.6.1, cvc5 1.3.2, Z3 4.15.4.
-- Older versions (`gnat_native_15.1.2`, `gnatprove_15.1.0`) are also in the
-  cache; prefer the ones above.
+`alr` supplies the compiler and sets `GPR_PROJECT_PATH` to the three layer
+directories, which is how the projects find each other by name
+(`with "minicoro.gpr"`). Nothing else needs exporting. To drive a tool `alr`
+does not wrap, borrow its environment with `alr exec -- <cmd>`.
+
+- Alire 2.1.1, GNAT 16.1.0 (`x86_64-linux-gnu`), GPRBUILD 26.0.1.
+- GNATprove is *not* an Alire dependency of the crate — proving is a
+  maintainer activity, not part of building. The release is in the cache at
+  `~/.local/share/alire/releases/gnatprove_16.1.0_*/bin`; put that on `PATH`
+  along with the GNAT and GPRBUILD toolchains under
+  `~/.local/share/alire/toolchains/` when you want to prove.
+- GNATprove FSF 16.1.0 with Alt-Ergo 2.6.1, cvc5 1.3.2, Z3 4.15.4.
 - `gnatprove --version` prints the version and *then* raises
   `ADA.IO_EXCEPTIONS.DEVICE_ERROR`. Harmless, ignore it.
-
-Projects find each other through `GPR_PROJECT_PATH`:
-
-```sh
-export GPR_PROJECT_PATH="/c/github/ada-generators/minicoro:/c/github/ada-generators/coroutines:/c/github/ada-generators/generators"
-```
 
 ## Build and test
 
 ```sh
-cd minicoro/tests    && gprbuild -q -P tests.gpr && ./exe/test_golden.exe && ./exe/test_coro.exe
-cd coroutines/tests  && gprbuild -q -P tests.gpr
-cd generators/tests  && gprbuild -q -P tests.gpr
+alr build     # all six projects: three layers, then their testsuites
+alr test      # builds, then runs run_tests.py
 ```
 
-**`run.py` reports every test as DIFF on Windows.** The reference files in
-`ref/` have LF endings; the executables emit CRLF. `run.py` compares bytes. It
-is not wrong about anything else — normalise before comparing:
+`alr test` swallows the output and writes it to
+`alire/alr_test_local.log`; run `python3 run_tests.py` from the root instead
+if you want to watch it. Either way the runner reports one verdict per case
+and exits non-zero on any failure.
 
-```sh
-for t in $(ls ref/); do
-  o=$("./exe/$t.exe" 2>&1 | tr -d '\r'); r=$(cat "ref/$t")
-  [ "$o" = "$r" ] && echo "OK   $t" || echo "DIFF $t"
-done
-```
+Expected: **2/2 minicoro, 17/17 coroutines, 8/8 generators — 27 in all.**
 
-`generators/tests` has parameterised cases: `test_complete` runs with argument
-`0`, `1`, `2` against `ref/test_complete_{0,1,2}`.
+`run_tests.py` normalises output to LF before comparing against `ref/`. The
+per-suite `run.py` drivers still exist and still compare raw bytes, which is
+why **`run.py` reports every test as DIFF on Windows**: the reference files
+have LF endings and the executables emit CRLF. `run.py` is not wrong about
+anything else. `run_tests.py` also knows the parameterised cases —
+`test_complete` runs with argument `0`, `1`, `2` against
+`ref/test_complete_{0,1,2}`.
 
-Expected: **17/17 coroutines, 8/8 generators, 2/2 minicoro.**
+The two `minicoro` cases are self-checking rather than golden: they print
+`ok`/`FAIL` lines, and the runner fails the case on any line beginning with
+`FAIL` or a non-zero exit status.
 
 ## Proving
 
 ```sh
+export PATH="$HOME/.local/share/alire/releases/gnatprove_16.1.0_82528bef/bin:\
+$HOME/.local/share/alire/toolchains/gnat_native_16.1.0_9f74f58a/bin:\
+$HOME/.local/share/alire/toolchains/gprbuild_26.0.1_e3f27f25/bin:$PATH"
 cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail
 ```
 
@@ -85,7 +89,7 @@ detail.
 `obj/gnatprove/gnatprove.out` holds the summary table; read lines 5-24.
 
 Do not run `gprbuild` and `gnatprove` on `minicoro/` at the same time — they
-share `obj/`.
+share `obj/`. That includes `alr build` and `alr test`, which call `gprbuild`.
 
 The single justification is in `Minicoro.Transfer`: SPARK's anti-aliasing rule
 (RM 6.4.2) is syntactic and treats `Coros (From).Ctx` and `Coros (To).Ctx` as
@@ -102,6 +106,22 @@ Use the Write tool for Ada sources, or a Python script for surgical edits.
 **Python writes CRLF.** `open(p, 'w')` on Windows translates `\n` to `\r\n`,
 and `-gnatyg` rejects that with `(style) incorrect line terminator`. Always
 `open(p, 'w', encoding='utf-8', newline='\n')`, and read with `newline=''`.
+
+**Array aggregates must use `[...]`.** Ada 2022 makes `(others => X)` for an
+*array* obsolescent, `-gnatwa` warns about it (`-gnatwj`), and `-gnatwae`
+turns that into an error. Every array aggregate in the tree is bracketed;
+record aggregates keep their parentheses, and so does the record aggregate
+that *contains* a bracketed array component:
+
+```ada
+Bytes  : Insn_Bytes := [others => 16#90#];          --  array
+Ctx.XMM := [others => 0];                            --  array
+Unmade : constant Context_Model :=
+  (Regs => [others => Junk], SP => 0, ...);          --  record of array
+```
+
+The compiler names every site, so the cheap way to convert is to build, fix
+what it lists, and repeat — it stops at the first file each time.
 
 **`-gnatyg` (in every `.gpr` here) is strict**, and `-gnatwae` makes warnings
 fatal. It will reject:
@@ -224,7 +244,9 @@ destroyed while the coroutine ran.
 
 ## Conventions
 
-- Ada 2012 (`-gnat12`), LF endings, 79 columns, GNAT style.
+- Ada 2022 (`-gnat2022`), LF endings, 79 columns, GNAT style. All six
+  `.gpr` files carry the same `("-gnat2022", "-gnatwae", "-gnatyg")`; keep
+  them in step.
 - Copyright headers: existing files keep
   `Copyright (C) 2014-2022, Pierre-Marie de Rodat`; new files use
   `Copyright (C) 2026, ada-generators contributors`. All `Apache-2.0`.
@@ -240,7 +262,17 @@ destroyed while the coroutine ran.
 - Only x86-64 is implemented (Win64 and System V). Other architectures need
   their own encoder. minicoro itself also has ucontext, fibers and Asyncify
   backends; none are ported.
-- The POSIX `Code_Page` body compiles cleanly but has never been run — there is
-  no Linux/macOS machine here. Treat it as untested.
+- The POSIX `Code_Page` body (`mmap`/`mprotect`) now runs: the full 27-case
+  suite passes on x86-64 Linux under GNAT 16.1, which exercises it together
+  with the System V switch routine. macOS and the BSDs are still untested —
+  `MAP_ANONYMOUS` differs there and `On_Linux` picks the value by inspecting
+  `Standard'Target_Name`.
+- GNATprove warns on `minicoro-code_page__posix.adb:74`, where `MAP_FAILED` is
+  written `System'To_Address (-1)`, that `Constraint_Error` will be raised.
+  It is not: GNAT folds the static attribute to the all-ones address, and the
+  line is on the success path of every `Allocate` the testsuite performs. The
+  warning is the SPARK frontend being stricter than the compiler about a unit
+  that is `SPARK_Mode => Off` anyway. Left alone; it costs a proof warning,
+  not a check.
 - Nothing is committed. The user pushes to their own fork
   (`https://github.com/ValorZard/ada-generators-slop.git`) themselves.
