@@ -11,42 +11,39 @@ with Ada.Exceptions; use Ada.Exceptions;
 with Ada.Unchecked_Deallocation;
 
 with Coroutines;
+with Generator_Coros;
 
 package body Generators with SPARK_Mode => On is
 
    package GS renames Generator_Slots;
+   package GC renames Generator_Coros;
    use all type GS.State_Type;
+   use all type GC.Result;
 
    ------------------
    -- The pool --
    ------------------
 
-   type Generator_Record is record
-      Delegate : Delegate_Access := null;
-      --  User delegate, to be run under Generator_Delegate.
-
-      Coro     : Coroutines.Coroutine;
-      --  Coroutine that runs this generator.
-
-      Caller   : Coroutines.Coroutine;
-      --  Just before switching to the generator coroutine, set to reference
-      --  the coroutine it is supposed to switch back to.
-   end record;
-   --  Only what depends on the formal type or on Coroutines. The reference
-   --  count, the in-use flag, the delegate-ownership flag and the execution
-   --  state all live in Generator_Slots, which is non-generic and therefore
-   --  actually gets analysed.
-
-   Pool : array (Valid_Slot) of Generator_Record;
+   Delegates : array (Valid_Slot) of Delegate_Access := [others => null];
+   --  The user delegate, and by now the only thing left here that depends on
+   --  the formal type -- Delegate is declared inside this generic, because
+   --  Generate takes a Generator'Class.
+   --
+   --  Everything else that used to sit beside it in a Generator_Record has
+   --  been hoisted into a non-generic package, which is the only way code in
+   --  this tree gets analysed at all: the reference count, the in-use flag,
+   --  the delegate-ownership flag and the execution state into
+   --  Generator_Slots, and the two Coroutine handles into Generator_Coros.
 
    Values : array (Valid_Slot) of T;
-   --  What the generator yields, held apart from Generator_Record for the
-   --  same reason Coroutines holds its exception occurrences apart: T is a
-   --  formal private type with no default SPARK can see, and a component like
-   --  that makes the whole enclosing record count as uninitialised. Kept
-   --  separate, every component of Generator_Record has a default. A slot's
-   --  value is meaningless until its State has been Yielding; every read
-   --  below is guarded by that.
+   --  What the generator yields. Kept in its own array rather than beside
+   --  the delegate, for the same reason Coroutines holds its exception
+   --  occurrences apart: T is a formal private type with no default SPARK
+   --  can see, and one component like that makes a whole enclosing record
+   --  count as uninitialised. Flat parallel arrays are the house style
+   --  throughout this layer for exactly that reason -- there is no longer a
+   --  Generator_Record at all. A slot's value is meaningless until its State
+   --  has been Yielding; every read below is guarded by that.
 
    type Generator_Delegate is new Coroutines.Delegate with record
       Slot : Slot_Id := No_Slot;
@@ -110,7 +107,7 @@ package body Generators with SPARK_Mode => On is
 
       procedure Adopt_Delegate (Slot : Valid_Slot; D : Delegate_Access) is
       begin
-         Pool (Slot).Delegate := D;
+         Delegates (Slot) := D;
       end Adopt_Delegate;
 
       procedure Free_Delegate (Slot : Valid_Slot) is
@@ -118,9 +115,9 @@ package body Generators with SPARK_Mode => On is
            (Delegate'Class, Delegate_Access);
       begin
          if GS.Owns_Delegate (Slot) then
-            Free (Pool (Slot).Delegate);
+            Free (Delegates (Slot));
          else
-            Pool (Slot).Delegate := null;
+            Delegates (Slot) := null;
          end if;
       end Free_Delegate;
 
@@ -193,7 +190,7 @@ package body Generators with SPARK_Mode => On is
    begin
       GS.Claim (Slot);
       if Slot in Valid_Slot then
-         Pool (Slot).Caller := Coroutines.Current_Coroutine;
+         GC.Note_Caller (Slot);
       end if;
    end Claim_Slot;
 
@@ -203,17 +200,13 @@ package body Generators with SPARK_Mode => On is
 
    procedure Release (Slot : Valid_Slot) is
    begin
-      --  Do not rely on the usual coroutine completion mechanism (see Run):
-      --  kill a generator that is still alive rather than let it linger.
-      if Pool (Slot).Coro.Alive then
-         Pool (Slot).Coro.Kill;
-      end if;
-
-      Pool (Slot).Coro   := Coroutines.Null_Coroutine;
-      Pool (Slot).Caller := Coroutines.Null_Coroutine;
+      --  Kills the coroutine if it is still alive rather than letting it
+      --  linger; see the comment in Generator_Coros.Clear.
+      GC.Clear (Slot);
 
       --  Generator_Slots.Drop has already cleared the slot's bookkeeping by
-      --  the time we get here; what is left is the part it cannot see.
+      --  the time we get here; what is left is the part neither it nor
+      --  Generator_Coros can see, which is now just the delegate.
       Raw.Free_Delegate (Slot);
    end Release;
 
@@ -235,8 +228,8 @@ package body Generators with SPARK_Mode => On is
       Raw.Adopt_Delegate (Slot, D);
       GS.Set_Owns_Delegate (Slot, Transfer_Ownership);
 
-      Pool (Slot).Coro := Raw.New_Coroutine (Slot);
-      Pool (Slot).Coro.Spawn;
+      GC.Set_Coro (Slot, Raw.New_Coroutine (Slot));
+      GC.Spawn (Slot);
 
       return (Slot => Slot, Weak => False);
    end Create;
@@ -258,8 +251,8 @@ package body Generators with SPARK_Mode => On is
          G : constant Generator := (Slot => Slot, Weak => True);
       begin
          begin
-            if Pool (Slot).Delegate /= null then
-               Pool (Slot).Delegate.all.Generate (Generator'Class (G));
+            if Delegates (Slot) /= null then
+               Delegates (Slot).all.Generate (Generator'Class (G));
             end if;
          exception
             when others =>
@@ -273,7 +266,7 @@ package body Generators with SPARK_Mode => On is
       --  rely on usual coroutine completion mechanism.
 
       GS.Set_State (Slot, Returning);
-      Pool (Slot).Caller.Switch;
+      GC.Return_To_Caller (Slot);
    end Run;
 
    ---------------------------
@@ -281,14 +274,14 @@ package body Generators with SPARK_Mode => On is
    ---------------------------
 
    function Owned_By_Current_Task (G : Generator) return Boolean is
-     (Live (G) and then Pool (G.Slot).Coro.Owned_By_Current_Task);
+     (Live (G) and then GC.Owned_Here (G.Slot));
 
    -----------------
    -- Is_Detached --
    -----------------
 
    function Is_Detached (G : Generator) return Boolean is
-     (Live (G) and then Pool (G.Slot).Coro.Is_Detached);
+     (Live (G) and then GC.Is_Detached (G.Slot));
 
    ------------
    -- Detach --
@@ -302,7 +295,7 @@ package body Generators with SPARK_Mode => On is
       end if;
 
       begin
-         Pool (G.Slot).Coro.Detach;
+         GC.Detach (G.Slot);
       exception
          when Exc : Coroutines.Coroutine_Error =>
             raise Generator_Error with Exception_Message (Exc);
@@ -314,7 +307,7 @@ package body Generators with SPARK_Mode => On is
       --  usual case -- Advance already nulls it on the way out -- but a
       --  generator detached between Create and its first iteration would
       --  otherwise carry the creating task's handle across.
-      Pool (G.Slot).Caller := Coroutines.Null_Coroutine;
+      GC.Clear_Caller (G.Slot);
    end Detach;
 
    -----------
@@ -328,7 +321,7 @@ package body Generators with SPARK_Mode => On is
          raise Generator_Error with "uninitialized generator";
       end if;
 
-      Pool (G.Slot).Coro.Adopt;
+      GC.Adopt (G.Slot);
    exception
       when Exc : Coroutines.Coroutine_Error =>
          raise Generator_Error with Exception_Message (Exc);
@@ -342,7 +335,7 @@ package body Generators with SPARK_Mode => On is
    begin
       GS.Set_State (Slot, Yielding);
       Values (Slot) := Value;
-      Pool (Slot).Caller.Switch;
+      GC.Return_To_Caller (Slot);
    end Yield_Slot;
 
    -----------
@@ -363,21 +356,19 @@ package body Generators with SPARK_Mode => On is
    -------------
 
    procedure Advance (Slot : Valid_Slot) is
+      Res : GC.Result;
    begin
-      --  Checked here rather than left to Coroutines.Switch, which would
-      --  raise Coroutine_Error and let it out of an iteration primitive --
-      --  the one place in this package where the exception a caller sees
-      --  would not be Generator_Error. It cannot be done by wrapping the
-      --  switch below in a handler either: that switch legitimately
-      --  propagates whatever the generator died of, and turning all of that
-      --  into Generator_Error would swallow the user's own exceptions.
-      if not Pool (Slot).Coro.Owned_By_Current_Task then
+      --  The affinity check and the switch both live in Generator_Coros
+      --  now, where they are analysed. What is left here is turning its
+      --  refusal into this instantiation's own exception -- which is exactly
+      --  why the refusal comes back as a status code rather than as a raise:
+      --  Generator_Error is declared inside this generic, so a non-generic
+      --  package cannot name it.
+      GC.Resume (Slot, Res);
+
+      if Res /= Success then
          raise Generator_Error with "generator belongs to another task";
       end if;
-
-      Pool (Slot).Caller := Coroutines.Current_Coroutine;
-      Pool (Slot).Coro.Switch;
-      Pool (Slot).Caller := Coroutines.Null_Coroutine;
    end Advance;
 
    --------------
@@ -411,9 +402,7 @@ package body Generators with SPARK_Mode => On is
             --  We do not want to rely on usual coroutine completion mechanism
             --  (see Run), so kill completed generators as soon as possible.
 
-            if Pool (G.Slot).Coro.Alive then
-               Pool (G.Slot).Coro.Kill;
-            end if;
+            GC.Kill_If_Alive (G.Slot);
             return False;
       end case;
    end Has_Next;

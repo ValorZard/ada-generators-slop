@@ -82,6 +82,7 @@ Minicoro.Code_Page      SPARK   W^X page from the OS
 Coroutines              SPARK   except where the published API and the
                                 SPARK subset disagree
 Generator_Slots         SPARK   generator ref counting + slot lifecycle
+Generator_Coros         SPARK   the coroutine behind a generator; affinity
 Generators              SPARK   except the iteration interface
 ```
 
@@ -111,14 +112,21 @@ instantiate it, since its `Iterable` aspect names the three functions that
 advance a generator, which must be outside SPARK because a SPARK function may
 not write globals. Left as one package it produced *zero* checks.
 
-Six of its seven per-generator fields turned out not to depend on the yielded
-type at all, so they moved into `Generator_Slots`, which is non-generic and
-therefore analysed directly. That is where the reference counting, slot
-allocation and execution state machine now live, with functional contracts
-rather than just runtime checks — `Drop` states the invariant that a slot is
-released exactly when its last reference goes, and proves it. What remains in
-the generic is what genuinely depends on the type: the yielded values, the
-user delegate, and the two coroutine handles.
+Almost nothing a generator slot holds turns out to depend on the yielded type,
+so almost none of it stayed. Two non-generic packages took it, and being
+non-generic they are analysed directly:
+
+* `Generator_Slots` — reference counting, slot allocation and the execution
+  state machine, with functional contracts rather than just runtime checks.
+  `Drop` states the invariant that a slot is released exactly when its last
+  reference goes, and proves it.
+* `Generator_Coros` — the coroutine that runs the generator and the one that
+  resumed it, and so the affinity guard, the resume/return pair and
+  kill-on-release.
+
+Between them they contribute 42 of the 871 checks. What remains in the generic
+is only what genuinely depends on the type: the yielded values and the user
+delegate. The record that used to hold all nine together is gone.
 
 At elaboration, `Minicoro.Machine_Code` assembles the switch routine from
 typed instruction encoders; `Minicoro.Code_Page` writes those bytes into a page
@@ -172,9 +180,9 @@ What is proved and what is assumed
 
 Being precise about this matters more than the headline number, which is
 `Success: all checks proved` — 612 checks for `minicoro`, 829 for
-`coroutines` and 856 for `generators`, each figure including the layers below
-it since the projects with each other. The full run is 351 run-time checks,
-112 functional contracts, 19 assertions, 72 termination checks and the flow
+`coroutines` and 871 for `generators`, each figure including the layers below
+it since the projects with each other. The full run is 466 run-time checks,
+124 functional contracts, 19 assertions, 82 termination checks and the flow
 analysis, with two justifications (see below) and nothing unproved.
 
 **Proved** (GNATprove, `gnatprove -P coroutines.gpr`, which covers both
@@ -207,6 +215,11 @@ layers):
   count of one, `Drop` that a slot is released exactly when its last
   reference goes, and `Set_State`/`Set_Owns_Delegate` that they change what
   they name and nothing else.
+* `Generator_Coros` — every one of its fourteen subprograms, which is where
+  a generator's task affinity is actually enforced: `Resume` refuses to
+  advance a generator the calling task does not own, and reports that as a
+  status code rather than an exception, because the exception belongs to the
+  generic.
 
 **Assumed.** Nine things, the first eight marked in the source and the
 ninth true of the whole library:

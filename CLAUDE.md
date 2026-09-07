@@ -18,6 +18,7 @@ A prototype for Ada generators/coroutines, in four layers, bottom up:
 |               | `Minicoro.Code_Page`     | yes   | W^X page from the OS                        |
 | `coroutines/` | `Coroutines`             | yes*  | ref-counted, GNAT-runtime-integrated wrapper |
 | `generators/` | `Generator_Slots`        | yes   | ref counting, slot allocation, state machine |
+|               | `Generator_Coros`        | yes   | the coroutine behind a generator; affinity, resume/return |
 |               | `Generators`             | yes*  | generator API over `Coroutines`             |
 
 `yes*` means the unit is `SPARK_Mode => On` with named exceptions inside it,
@@ -29,21 +30,30 @@ to another. That is a property of all three layers and is described in one
 place, "Threading model".
 
 No package in the tree is `SPARK_Mode => Off`, and all three proof runs are
-clean: `minicoro/` 612 checks, `coroutines/` 829, `generators/` 856 — each
+clean: `minicoro/` 612 checks, `coroutines/` 829, `generators/` 871 — each
 figure including the layers below it, since the projects with each other —
 all with 2 justified and **0 unproved**.
 
-`generators/` is the subtle one, and `Generator_Slots` is why it works.
-`Generators` is a *generic*; GNATprove analyses instantiations rather than
-generic units, and no SPARK unit can instantiate this one (its `Iterable`
-aspect names the three `Off` functions that advance a generator). Left as one
-package it produced literally zero checks. Splitting the `T`-independent
-half — reference counting, slot allocation, the execution state machine —
-into the non-generic `Generator_Slots` sidesteps that entirely: non-generic
-packages are analysed directly. 27 of the 856 checks are its own — five of
-them postconditions, on `Claim`, `Bump`, `Drop`, `Set_State` and
-`Set_Owns_Delegate` — and they are the ones where a generator bug would
-live.
+`generators/` is the subtle one, and the two non-generic packages are why it
+works. `Generators` is a *generic*; GNATprove analyses instantiations rather
+than generic units, and no SPARK unit can instantiate this one (its
+`Iterable` aspect names the three `Off` functions that advance a generator).
+Left as one package it produced literally zero checks. Hoisting everything
+that does not depend on the formal type into non-generic packages sidesteps
+that entirely, because non-generic packages are analysed directly. 42 of the
+871 checks are theirs:
+
+- `Generator_Slots` — 27, the reference counting, slot allocation and the
+  execution state machine. Five are postconditions, on `Claim`, `Bump`,
+  `Drop`, `Set_State` and `Set_Owns_Delegate`, and they are the ones where a
+  reference-counting bug would live.
+- `Generator_Coros` — 15, the coroutine that runs a generator and the one
+  that resumed it. This is where the affinity guard, the resume/return pair
+  and kill-on-release now sit; all fourteen of its subprograms are analysed.
+
+What is left inside the generic is only what genuinely depends on `T`: the
+`Values` array and the user delegate. There is no `Generator_Record` any
+more.
 
 `minicoro/` replaced a thin binding to PCL (the old `pcl/` directory, deleted).
 The `generators/` layer was untouched by that swap — the change is confined to
@@ -133,7 +143,7 @@ that run re-analyses everything and is the one to trust if you only run one.
 cd generators  && gnatprove -P generators.gpr  --level=2 -j4 --report=fail
 ```
 
-Expected there: `Success: all checks proved (856 checks)`, 2 justified, 0
+Expected there: `Success: all checks proved (871 checks)`, 2 justified, 0
 unproved. That run covers all three layers, so it is the single command to
 use if you only run one.
 
@@ -156,8 +166,9 @@ argument, so its callers carry an extra obligation; and `Detach`, `Adopt` and
 
 Then the atomic reference count took `coroutines/` back down, 786 to 777, and
 `generators/` 813 to 804 — the same nine. (The procedure forms of `Create`
-and friends later took them to 829 and 856, which is new verified code rather
-than anything moving around.) **This one was checked, not
+and friends later took them to 829 and 856, and `Generator_Coros` took
+`generators/` on to 871; both are new verified code rather than anything
+moving around.) **This one was checked, not
 assumed**, per the rule above. The nine are all runtime checks on arithmetic
 that no longer exists in SPARK code: six `Ref_Count + 1` / `- 1` sites in
 `Bump`, `Drop`, `Release`, `Claim_Slot`, `Current_Coroutine` and
@@ -176,8 +187,16 @@ medium: postcondition might fail, cannot prove
 
 so the reference-counting invariant is still proved, now discharged from
 `Atomics.Decrement`'s contract instead of from inline arithmetic. The
-`generators/` minus `coroutines/` difference is still exactly 27, which is
-`Generator_Slots`' own contribution and is unchanged.
+`generators/` minus `coroutines/` difference was exactly 27 at that point,
+which was `Generator_Slots`' own contribution.
+
+Hoisting `Coro`/`Caller` into `Generator_Coros` then took `generators/` from
+856 to 871, and that difference from 27 to 42. Same rule, opposite direction
+and no mystery: the 15 are a new non-generic package's own checks, on code
+that GNATprove could not see while it sat inside the generic. The split is
+visible in the run itself -- `generator_coros` reports 14 subprograms out of
+14 analysed, where `generators` still reports 0 out of 0. `coroutines/` is
+untouched at 829, as it must be: nothing below `generators/` changed.
 
 Each run takes roughly 10-40 minutes — start it in the background and do not
 poll it. `--level=3` also passes; `--report=statistics` if you want per-check
@@ -441,13 +460,42 @@ GNATprove 16.1 rather than reasoned about:
   coroutine plumbing analysed, which is why it stays on the list under "Not
   done" — just know it is a partial win.
 
-**The way round is `Generator_Slots`.** Six of the seven fields in the old
-`Generator_Record` did not depend on the formal type at all. Hoisted into a
-non-generic package they are analysed directly, no instantiation involved:
+**The way round is to hoist.** Only two of the nine things a generator slot
+holds actually depend on the formal type. The rest went into non-generic
+packages, where they are analysed directly with no instantiation involved:
 
-| Stayed in the generic | Moved to `Generator_Slots` |
-|-----------------------|----------------------------|
-| `Delegate`, `Coro`, `Caller`, `Values` | `Ref_Count`, `In_Use`, `Owns_Delegate`, `State` |
+| Stayed in the generic | `Generator_Slots` | `Generator_Coros` |
+|-----------------------|-------------------|-------------------|
+| `Values`, `Delegate`  | `Ref_Count`, `In_Use`, `Owns_Delegate`, `State` | `Coro`, `Caller` |
+
+`Delegate` has to stay: `Generators.Delegate` is declared inside the generic,
+because `Generate` takes a `Generator'Class`. `Values` has to stay because it
+is an array of `T`. Nothing else did, and the old `Generator_Record` that
+held them together is gone -- the generic keeps two flat parallel arrays now,
+which is the house style for the reason under "Keep the odd component out of
+the record".
+
+`Generator_Coros` was the second half of that split and came later. Two
+shapes in it are worth knowing before touching it:
+
+- **Refusal comes back as a status code, not a raise.** `Resume` reports
+  `Wrong_Task` the way `Minicoro` does, and `Generators.Advance` turns it
+  into `Generator_Error`. It has to work that way round: `Generator_Error` is
+  declared *inside* the generic, so each instantiation has its own and a
+  non-generic package cannot name it.
+- **`Detach` and `Adopt` are the deliberate exception** and let
+  `Coroutine_Error` through, because `Generators` re-raises it as
+  `Generator_Error` carrying the same message, and that message is worth
+  keeping.
+
+One property was tried and dropped rather than forced: `Clear` would like
+`Post => not Is_Alive (S)`, which is true. It does not prove, because the
+prover would have to know that `Coroutines.Null_Coroutine` is not alive.
+`Coroutines.Alive`'s body is an expression function over `Alive_Slot`,
+visible only inside that package, and `Coroutine`'s full view sits in a
+private part, so a postcondition on `Alive` could not name the slot either.
+Stating it meant widening `Coroutines`' interface to serve one caller, which
+is the worse trade; the reasoning is recorded at the site.
 
 `Generator_Slots` carries real functional contracts rather than just runtime
 checks — `Drop` states the reference-counting invariant and proves it:
@@ -832,6 +880,17 @@ The first two were blocking `Initializes`; the third was making
 nothing could be said about a coroutine's storage across `Resume` or `Yield`.
 In all three cases a parallel array indexed the same way fixed it, and the
 enclosing record went back to being fully default-initialised.
+
+*And in a generic, splitting the struct is what gets it analysed at all.*
+This is the same rule with a much larger payoff, because the alternative is
+not a weaker proof but no proof. `Generators`' old `Generator_Record` held
+nine things, of which two depend on the formal type; GNATprove does not read
+generic units, so all nine were invisible. Splitting it twice --
+`Generator_Slots` first, `Generator_Coros` later -- moved seven of them into
+non-generic packages and took the layer from 0 checks of its own to 42. The
+question to ask of any state in a generic here is not "is this tidy" but
+"does this depend on the formal types", because if it does not, leaving it
+inside means it is never checked.
 
 **Coroutines are pool indices, not pointers — at both layers.** `Minicoro`
 holds
@@ -1312,12 +1371,14 @@ destroyed while the coroutine ran.
 - Eleven `operator-reassociation` warnings remain under `--pedantic`. Purely
   cosmetic; see "Proof warnings", family 2.
 - `generators/` is proved to the same standard as the layers below it, but
-  only the `T`-independent half: `Generator_Slots` (reference counting, slot
-  allocation, the state machine) carries functional contracts, while the
-  generic itself still produces no checks of its own and cannot. If you want
-  more from that layer, the remaining candidates are `Coro`/`Caller` — they
-  are `T`-independent too and could follow the same route into a non-generic
-  package, at the cost of routing every coroutine operation through it.
+  only the `T`-independent part — which is now all of it except `Values` and
+  the user delegate. `Generator_Slots` (reference counting, slot allocation,
+  the state machine) and `Generator_Coros` (the coroutine handles, the
+  affinity guard, resume/return) are analysed and carry contracts; the
+  generic itself still produces no checks of its own and cannot.
+  `Coro`/`Caller` used to be listed here as the remaining candidates and have
+  since been hoisted, which is what `Generator_Coros` is. There is no obvious
+  next candidate: what is left in the generic depends on `T`.
 - `Coroutines` proves absence of runtime errors and its slot lifecycle, but
   carries no *functional* postconditions — nothing states what `Switch` does
   to the pool, only that it cannot go wrong. Contracts in the style of
