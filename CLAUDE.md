@@ -418,6 +418,88 @@ globals; the `Iterable` aspect fixes their profiles, so they cannot become
 procedures. A procedure form of `Generators.Create` would let a client build a
 generator it could not then use, so there is not one.
 
+It fails earlier than at `Yield`, though, and that is the part worth knowing.
+A SPARK unit cannot even *declare* the instantiation, so there is no
+`Generator` for it to hold and nothing to call `Yield` on. Checked against
+GNATprove 16.1 with a delegate whose `Generate` calls `G.Yield`:
+
+```
+error: "Yield" is not allowed in SPARK (due to entity declared with
+       SPARK_Mode Off)
+error: instantiation error at generators.ads:75
+       + "Next" is not allowed in SPARK (due to entity declared with
+          SPARK_Mode Off)          [and the same for Has_Element, Element]
+error: instantiation error at generators.adb:77
+       + function "New_Coroutine" with output global "Registry" is not
+          allowed in SPARK [E0005]
+```
+
+That last one is new information: `Raw.New_Coroutine` is a genuine `E0005`
+that the `Off` pragma on `Raw`'s body has been covering. It only surfaces
+once an instantiation makes the generic body concrete.
+
+A third wall stands behind those two even if both were removed. `Generate`
+overrides an abstract operation whose inferred `Global` is null, and SPARK RM
+6.1.6 requires an override's `Global` to be subsumed by the overridden one's
+-- the same rule recorded above for `Coroutines.Delegate.Run`. `Yield` writes
+the pool, so a `Generate` that calls it violates that no matter what mode
+`Yield` carries.
+
+The one thing a client does need first, and gets wrong once: a delegate's
+package needs `pragma Elaborate_Body`, or the type extension is rejected with
+`E0003` before any of the above is even reported.
+
+### Calling a generator from SPARK
+
+You cannot, directly -- but you can put one behind a boundary, and
+`generators/examples/spark_client` is a worked example that proves clean. It
+is proof-only, like the coroutines one: not built by `alr build`, not run by
+`alr test`, because there is no main at all and the point is what GNATprove
+says.
+
+```sh
+cd generators/examples/spark_client && gnatprove -P spark_client.gpr -j4 \
+  --report=fail
+```
+
+Expected: `Success: all checks proved (880 checks)`, 2 justified, 0 unproved.
+That figure is the whole library's 871 plus the example's own 9.
+
+The shape is the one used everywhere in this tree that SPARK cannot express
+something -- `Minicoro.Atomics` hides an atomic counter, `Minicoro.Contexts`
+hides a machine context switch, `Squares` hides a generator:
+
+```
+Safe_Client (SPARK_Mode => On, fully analysed)
+   |  calls a procedure with Global => (In_Out => Squares.State)
+   v
+Squares      spec SPARK_Mode => On, Abstract_State => State
+             body SPARK_Mode => Off  <-- instantiation, delegate, Yield,
+                                         Has_Next/Next all live here
+```
+
+Three things about it are load-bearing, and were found by trying:
+
+1. **The boundary must be a procedure.** A SPARK function may not write
+   globals (E0005) and driving a generator does. Same reason `Coroutines`
+   grew procedure forms of `Create` and friends.
+2. **The boundary must be bounded.** The result comes back as an array plus a
+   `Count`, not as a lazy sequence, because a SPARK caller needs a size to
+   reason about. This is a real loss: laziness is the point of a generator
+   and it does not survive the crossing. If a caller wants the values one at
+   a time it cannot have them, and no amount of contract writing changes
+   that.
+3. **The body carries no `Refined_State`.** A `SPARK_Mode => Off` body may
+   not, and `State` staying opaque is the intent -- see the rule under
+   "GNATprove-specific rejections".
+
+What the client gets is worth being precise about: `Safe_Client` is ordinary
+analysed SPARK, and GNATprove proves its arithmetic (that summing yielded
+values cannot overflow `Natural` in either direction). What it does *not* get
+is any guarantee about the generator, because `Squares`' body is not
+analysed. The contract `Post => Got = Wanted` is a claim, not a proof, in
+exactly the way `Contexts.Switch`'s postcondition is.
+
 ### How `generators/` got analysed, and why the tests still cannot be SPARK
 
 Two facts about generics collide here, and the way round them is worth
@@ -1379,6 +1461,15 @@ destroyed while the coroutine ran.
   `Coro`/`Caller` used to be listed here as the remaining candidates and have
   since been hoisted, which is what `Generator_Coros` is. There is no obvious
   next candidate: what is left in the generic depends on `T`.
+- **`Generator_Coros` carries no functional postconditions**, only absence of
+  runtime errors and its flow -- the same gap recorded just below for
+  `Coroutines`, now inherited by the newer package. Nothing states what
+  `Resume` does to the pool. Contracts in the style of `Generator_Slots.Drop`
+  are the next real strengthening there, and unlike the `Iterable` wall this
+  one is actually reachable. One was tried and dropped:
+  `Clear`'s `Post => not Is_Alive (S)` needs `Coroutines` to expose that a
+  null coroutine is not alive, and widening that interface for one caller was
+  the worse trade; the reasoning is at the site.
 - `Coroutines` proves absence of runtime errors and its slot lifecycle, but
   carries no *functional* postconditions — nothing states what `Switch` does
   to the pool, only that it cannot go wrong. Contracts in the style of

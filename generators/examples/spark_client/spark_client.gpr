@@ -1,0 +1,29 @@
+--  Copyright (C) 2026, ada-generators contributors
+--  SPDX-License-Identifier: Apache-2.0
+
+--  Proof-only, like coroutines/examples/spark_client: not built by
+--  `alr build` and not run by `alr test`. The thing being checked is what
+--  GNATprove says, not what the program prints -- there is no main here at
+--  all. See CLAUDE.md, "Calling a generator from SPARK".
+--
+--  No conf.adc, unlike the coroutines example: that one needs Ravenscar
+--  because it has tasks and is demonstrating data-race detection. This one
+--  is single-task and is demonstrating a trusted boundary, so it needs
+--  neither pragma.
+
+with "generators.gpr";
+
+project Spark_Client is
+   for Source_Dirs use (".");
+   for Object_Dir use "obj";
+
+   package Compiler is
+      for Default_Switches ("Ada") use
+        ("-gnat2022", "-gnatwae", "-gnatyg", "-gnatX");
+   end Compiler;
+
+   package Prove is
+      for Proof_Switches ("Ada") use ("--level=2", "--timeout=60");
+   end Prove;
+
+end Spark_Client;

@@ -128,6 +128,14 @@ Between them they contribute 42 of the 871 checks. What remains in the generic
 is only what genuinely depends on the type: the yielded values and the user
 delegate. The record that used to hold all nine together is gone.
 
+None of that makes generators usable *from* SPARK, and nothing can: a SPARK
+unit cannot even declare the instantiation, so there is no generator for it
+to hold. What works instead is a boundary --
+`generators/examples/spark_client` is a worked one that proves clean, with a
+SPARK spec over a `SPARK_Mode => Off` body that hides the generator, the
+delegate and `Yield`. The cost is that the result has to come back bounded,
+so laziness does not survive the crossing.
+
 At elaboration, `Minicoro.Machine_Code` assembles the switch routine from
 typed instruction encoders; `Minicoro.Code_Page` writes those bytes into a page
 that is made read+execute *before* any address in it is handed out, so the
