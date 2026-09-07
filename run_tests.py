@@ -71,6 +71,7 @@ SUITES = (
         ("test_chained", [], "test_chained"),
         ("test_work_stealing", [], "test_work_stealing"),
         ("test_migrate_midway", [], "test_migrate_midway"),
+        ("test_advance_after_move", [], "test_advance_after_move"),
     )),
 )
 

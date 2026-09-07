@@ -50,7 +50,7 @@ $ alr test
 ```
 
 That builds everything and then runs `run_tests.py`, which reports one verdict
-per case — 33 in total: 2 in `minicoro/tests`, 21 in `coroutines/tests` and 10
+per case — 34 in total: 2 in `minicoro/tests`, 21 in `coroutines/tests` and 11
 in `generators/tests`. `alr` writes the report to
 `alire/alr_test_local.log`; run `python3 run_tests.py` directly to watch it
 live.

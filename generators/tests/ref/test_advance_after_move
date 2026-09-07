@@ -1,0 +1,11 @@
+main got 1
+worker: refused -- generator belongs to another task
+main: detached, detached = TRUE
+main: refused -- generator belongs to another task
+worker: adopted, owned by me = TRUE
+worker got 2
+worker got 3
+main: adopted back, owned by me = TRUE
+main got 4
+main: exhausted
+main: done

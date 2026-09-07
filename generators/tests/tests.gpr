@@ -13,7 +13,8 @@ project Tests is
       "test_complete.adb",
       "test_chained.adb",
       "test_work_stealing.adb",
-      "test_migrate_midway.adb");
+      "test_migrate_midway.adb",
+      "test_advance_after_move.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use

@@ -101,15 +101,16 @@ alr test      # builds, then runs run_tests.py
 if you want to watch it. Either way the runner reports one verdict per case
 and exits non-zero on any failure.
 
-Expected: **2/2 minicoro, 21/21 coroutines, 10/10 generators — 33 in all.**
+Expected: **2/2 minicoro, 21/21 coroutines, 11/11 generators — 34 in all.**
 
-The six newest cases are the task-affinity ones and each uses real Ada
+The seven newest cases are the task-affinity ones and each uses real Ada
 tasks: `coroutines/tests/test_task_affinity`,
 `coroutines/tests/test_continue_after_move`,
 `coroutines/tests/test_too_many_tasks`,
 `coroutines/tests/test_shared_refcount`,
-`generators/tests/test_work_stealing` and
-`generators/tests/test_migrate_midway`. They are golden-output cases like
+`generators/tests/test_work_stealing`,
+`generators/tests/test_migrate_midway` and
+`generators/tests/test_advance_after_move`. They are golden-output cases like
 the rest, and they are deterministic on purpose — nothing they print
 depends on which task wins a race. See "Threading model".
 
@@ -710,7 +711,7 @@ instant `Contexts.Switch` returns.
 With `Current` and `Coros` havoc'd, the three `pragma Assume`s stopped being
 contradictions and became genuine restorations, and the postconditions are
 proved from them for real. The helper compiles to nothing, so there is no
-runtime effect; the 33-case suite was re-run to confirm it.
+runtime effect; the 34-case suite was re-run to confirm it.
 
 Do not write an explicit `Global` on `Transfer` itself — it would have to
 enumerate `Main_Ctx` and `Contexts.Backend_State`, and the child's state is
@@ -774,7 +775,7 @@ compiler disagree about the target
 GNATprove proves the `return True` inside `On_Linux` unreachable, i.e. that
 `Standard'Target_Name` never contains "linux". The compiler disagrees: on this
 machine `Standard'Target_Name` is `"x86_64-pc-linux-gnu"` (19 chars, "linux"
-at index 11), GNAT folds the search accordingly, and the 33-case suite passes
+at index 11), GNAT folds the search accordingly, and the 34-case suite passes
 — which it could not if `MAP_ANONYMOUS` came out as the BSD `0x1000` instead
 of Linux's `0x20`, because `mmap` would fail and `Create` would return
 `Make_Context_Error`.
@@ -1243,8 +1244,22 @@ tasks; `coroutines/tests/test_too_many_tasks` walks off the `Max_Owners`
 ceiling and confirms the surplus tasks are refused rather than given a number
 already in use; `generators/tests/test_work_stealing` runs eight detached
 generators across three worker tasks; `generators/tests/test_migrate_midway`
-alternates a single generator between two tasks on every yield. All four are
-golden-output tests
+alternates a single generator between two tasks on every yield.
+
+`generators/tests/test_advance_after_move` is the generator counterpart of
+`test_continue_after_move`, and pins down the two things about the refusal
+that are easy to get wrong. First, it is `Generator_Error` and not
+`Coroutine_Error` -- which is why `Advance` tests ownership itself rather
+than leaving it to `Coroutines.Switch`; that would let the lower layer's
+exception out of an iteration primitive, the one place in the package where
+a caller would see something else. Second, the value proves the generator
+*resumed* rather than restarted: main draws 1, the worker is refused, and
+after the move the worker's identical call yields 2. A generator that
+restarted would print 1 again. It also shows that detached means detached --
+after main lets go, main is refused too, because ownership is what the check
+tests and not history.
+
+All of these are golden-output tests
 and are deterministic despite the scheduling, because none of them prints
 anything that depends on which task won a race.
 
@@ -1308,7 +1323,7 @@ The remaining route to real per-task pools is to stop having global state at
 all: pass an explicit scheduler object to every operation, so each task
 creates its own. That is zero-cost, is the best possible SPARK story (no
 globals means no data races by construction), and is a rewrite of the public
-API of all three layers plus all 33 tests. It has not been attempted.
+API of all three layers plus all 34 tests. It has not been attempted.
 
 ## What is proved vs assumed
 
