@@ -1,0 +1,5 @@
+all jobs detached: TRUE
+jobs done: 8
+total: 120
+total as expected: TRUE
+handed back detached: TRUE

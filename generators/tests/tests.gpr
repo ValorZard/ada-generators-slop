@@ -11,7 +11,9 @@ project Tests is
       "test_twice_kill.adb",
       "test_stop_resume.adb",
       "test_complete.adb",
-      "test_chained.adb");
+      "test_chained.adb",
+      "test_work_stealing.adb",
+      "test_migrate_midway.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use

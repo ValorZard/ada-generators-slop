@@ -131,6 +131,47 @@ package Generators with SPARK_Mode => On is
    --  Exceptional_Cases on a dispatching operation. The work is in
    --  Yield_Slot, which is analysed.
 
+   -------------------
+   -- Task affinity --
+   -------------------
+
+   --  A generator belongs to one task at a time -- the one that may advance
+   --  it -- because the coroutine underneath it does. Detach and Adopt move
+   --  it, and are the pair that makes work stealing possible: a detached
+   --  generator is a unit of work that any task may pick up.
+   --
+   --     --  producer                       --  worker
+   --     G.Detach;                          Queue.Take (G);
+   --     Queue.Put (G);                     G.Adopt;
+   --                                        for V of G loop ... end loop;
+   --
+   --  Read the "Task affinity" section of coroutines.ads before using this.
+   --  It states the one thing the caller must still arrange -- that two tasks
+   --  do not create at the same time -- and what is deliberately left
+   --  unguarded, which is everything that only reads. Handles themselves are
+   --  safe to copy and drop on any task: the reference count is atomic.
+
+   function Owned_By_Current_Task (G : Generator) return Boolean;
+   --  Whether the calling task may advance G. False for an uninitialized or
+   --  detached generator.
+
+   function Is_Detached (G : Generator) return Boolean;
+   --  Whether G belongs to no task and is available to Adopt.
+
+   procedure Detach (G : Generator)
+     with SPARK_Mode => Off;
+   --  Give up ownership of G so another task may Adopt it. Raises
+   --  Generator_Error if G is uninitialized, belongs to another task, or is
+   --  running -- a generator cannot detach itself from inside Generate.
+   --
+   --  Legal between iterations, which is the only place it makes sense: the
+   --  generator is parked at its last Yield and nothing is waiting on it.
+
+   procedure Adopt (G : Generator)
+     with SPARK_Mode => Off;
+   --  Take ownership of a detached generator. Raises Generator_Error if G is
+   --  uninitialized or still belongs to a task.
+
    -------------------------------
    -- Basic iteration interface --
    -------------------------------

@@ -1,0 +1,13 @@
+   coroutine: step 1
+main: continued it
+worker: refused -- Trying to switch to a coroutine of another task
+main: refused -- Trying to switch to a coroutine of another task
+worker: adopted, owned by me = TRUE
+   coroutine: step 2
+worker: continued it
+   coroutine: step 3
+worker: continued it
+main: adopted back, owned by me = TRUE
+main: continued it
+main: alive = FALSE
+main: done

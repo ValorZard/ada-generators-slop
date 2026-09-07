@@ -28,7 +28,12 @@ project Tests is
       "test_resume_parent_dead.adb",
 
       "test_reference_loop.adb",
-      "test_secondary_stack.adb");
+      "test_secondary_stack.adb",
+
+      "test_task_affinity.adb",
+      "test_too_many_tasks.adb",
+      "test_continue_after_move.adb",
+      "test_shared_refcount.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use

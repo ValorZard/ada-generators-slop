@@ -1,0 +1,8 @@
+main got 1
+helper got 2
+main got 3
+helper got 4
+main got 5
+helper got 6
+main: exhausted
+main: reclaimed

@@ -1,0 +1,8 @@
+--  Copyright (C) 2026, ada-generators contributors
+--  SPDX-License-Identifier: Apache-2.0
+
+--  SPARK will not look at tasking at all without both of these: it reports
+--  "tasking in SPARK requires Ravenscar profile" and then "requires
+--  sequential elaboration".
+pragma Profile (Ravenscar);
+pragma Partition_Elaboration_Policy (Sequential);

@@ -1,0 +1,28 @@
+--  Copyright (C) 2026, ada-generators contributors
+--  SPDX-License-Identifier: Apache-2.0
+
+--  Proof-only. This is not built by `alr build` and not run by `alr test`:
+--  its tasks loop forever, because Ravenscar tasks are not meant to
+--  terminate, and the thing being checked is what GNATprove says rather than
+--  what the program prints. See CLAUDE.md, "Proving a client".
+
+with "coroutines.gpr";
+
+project Spark_Client is
+   for Source_Dirs use (".");
+   for Object_Dir use "obj";
+
+   package Builder is
+      for Global_Configuration_Pragmas use "conf.adc";
+   end Builder;
+
+   package Compiler is
+      for Default_Switches ("Ada") use
+        ("-gnat2022", "-gnatwae", "-gnatyg", "-gnatX");
+   end Compiler;
+
+   package Prove is
+      for Proof_Switches ("Ada") use ("--level=1", "--timeout=60");
+   end Prove;
+
+end Spark_Client;

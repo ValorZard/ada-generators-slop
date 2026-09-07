@@ -1,0 +1,17 @@
+main: owned by me = TRUE
+main: detached = FALSE
+foreign: switch -> Trying to switch to a coroutine of another task
+foreign: kill -> Coroutine belongs to another task
+foreign: detach -> Detach failed: WRONG_TASK
+foreign: adopt -> Adopt failed: WRONG_TASK
+foreign: owned by me = FALSE
+main: detached = TRUE
+main: owned by me = FALSE
+mover: owned by me = TRUE
+mover: detached = FALSE
+mover: back from the coroutine
+mover: still alive = FALSE
+mover: detached again
+main: owned by me again = TRUE
+main: alive = FALSE
+main: done

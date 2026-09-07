@@ -1,0 +1,4 @@
+before: alive = TRUE
+after:  alive = TRUE
+owned by me =   TRUE
+main: done

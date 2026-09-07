@@ -54,6 +54,11 @@ SUITES = (
 
         ("test_reference_loop", [], "test_reference_loop"),
         ("test_secondary_stack", [], "test_secondary_stack"),
+
+        ("test_task_affinity", [], "test_task_affinity"),
+        ("test_too_many_tasks", [], "test_too_many_tasks"),
+        ("test_continue_after_move", [], "test_continue_after_move"),
+        ("test_shared_refcount", [], "test_shared_refcount"),
     )),
     ("generators/tests", (
         ("test_empty", [], "test_empty"),
@@ -64,6 +69,8 @@ SUITES = (
         ("test_complete", ["1"], "test_complete_1"),
         ("test_complete", ["2"], "test_complete_2"),
         ("test_chained", [], "test_chained"),
+        ("test_work_stealing", [], "test_work_stealing"),
+        ("test_migrate_midway", [], "test_migrate_midway"),
     )),
 )
 

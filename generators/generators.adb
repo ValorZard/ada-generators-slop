@@ -7,6 +7,7 @@
 --  hand-offs in one place, as Coroutines.Raw does, so that the boundary stays
 --  visible if the mode is ever revisited.
 
+with Ada.Exceptions; use Ada.Exceptions;
 with Ada.Unchecked_Deallocation;
 
 with Coroutines;
@@ -275,6 +276,64 @@ package body Generators with SPARK_Mode => On is
       Pool (Slot).Caller.Switch;
    end Run;
 
+   ---------------------------
+   -- Owned_By_Current_Task --
+   ---------------------------
+
+   function Owned_By_Current_Task (G : Generator) return Boolean is
+     (Live (G) and then Pool (G.Slot).Coro.Owned_By_Current_Task);
+
+   -----------------
+   -- Is_Detached --
+   -----------------
+
+   function Is_Detached (G : Generator) return Boolean is
+     (Live (G) and then Pool (G.Slot).Coro.Is_Detached);
+
+   ------------
+   -- Detach --
+   ------------
+
+   procedure Detach (G : Generator) is
+      pragma SPARK_Mode (Off);
+   begin
+      if not Live (G) then
+         raise Generator_Error with "uninitialized generator";
+      end if;
+
+      begin
+         Pool (G.Slot).Coro.Detach;
+      exception
+         when Exc : Coroutines.Coroutine_Error =>
+            raise Generator_Error with Exception_Message (Exc);
+      end;
+
+      --  Forget who last advanced it. Caller names a coroutine of the task we
+      --  are leaving; the next Advance sets it to one of the adopting task's
+      --  before anything can switch. Clearing it is only tidiness in the
+      --  usual case -- Advance already nulls it on the way out -- but a
+      --  generator detached between Create and its first iteration would
+      --  otherwise carry the creating task's handle across.
+      Pool (G.Slot).Caller := Coroutines.Null_Coroutine;
+   end Detach;
+
+   -----------
+   -- Adopt --
+   -----------
+
+   procedure Adopt (G : Generator) is
+      pragma SPARK_Mode (Off);
+   begin
+      if not Live (G) then
+         raise Generator_Error with "uninitialized generator";
+      end if;
+
+      Pool (G.Slot).Coro.Adopt;
+   exception
+      when Exc : Coroutines.Coroutine_Error =>
+         raise Generator_Error with Exception_Message (Exc);
+   end Adopt;
+
    ----------------
    -- Yield_Slot --
    ----------------
@@ -305,6 +364,17 @@ package body Generators with SPARK_Mode => On is
 
    procedure Advance (Slot : Valid_Slot) is
    begin
+      --  Checked here rather than left to Coroutines.Switch, which would
+      --  raise Coroutine_Error and let it out of an iteration primitive --
+      --  the one place in this package where the exception a caller sees
+      --  would not be Generator_Error. It cannot be done by wrapping the
+      --  switch below in a handler either: that switch legitimately
+      --  propagates whatever the generator died of, and turning all of that
+      --  into Generator_Error would swallow the user's own exceptions.
+      if not Pool (Slot).Coro.Owned_By_Current_Task then
+         raise Generator_Error with "generator belongs to another task";
+      end if;
+
       Pool (Slot).Caller := Coroutines.Current_Coroutine;
       Pool (Slot).Coro.Switch;
       Pool (Slot).Caller := Coroutines.Null_Coroutine;

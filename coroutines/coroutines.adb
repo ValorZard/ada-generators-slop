@@ -16,7 +16,7 @@ with Ada.Unchecked_Deallocation;
 
 with System;
 
-with Minicoro;
+with Minicoro.Atomics;
 
 pragma Warnings (Off);
 with System.Parameters;
@@ -33,9 +33,26 @@ is
    use type System.Secondary_Stack.SS_Stack_Ptr;
    use type Minicoro.Coroutine_Id;
    use type Minicoro.Entry_Point;
+   use type Minicoro.Owner_Id;
    use type Minicoro.Result;
 
    package SSL renames System.Soft_Links;
+   package Atomics renames Minicoro.Atomics;
+
+   subtype Owner_Id    is Minicoro.Owner_Id;
+   subtype Valid_Owner is Minicoro.Valid_Owner;
+
+   No_Owner : Owner_Id renames Minicoro.No_Owner;
+
+   pragma Compile_Time_Error
+     (Max_Tasks >= Max_Coroutines,
+      "Max_Tasks must leave room for user coroutines: slots 1 .. Max_Tasks "
+      & "are reserved, one per task, and User_Slot is what is left");
+   --  Checked by the compiler rather than the prover, for the same reason as
+   --  the layout guard in Contexts: the two constants come from different
+   --  packages -- Max_Tasks is Minicoro.Max_Owners -- and raising one without
+   --  looking at the other would silently give User_Slot a null range, which
+   --  shows up only as Create always returning Null_Coroutine.
 
    Abort_Coroutine : exception;
    --  Users should not be able to stop coroutine abortion.
@@ -45,9 +62,15 @@ is
    ----------------
 
    type Coroutine_Record is record
-      Ref_Count  : Natural := 0;
+      Ref_Count  : Atomics.Counter;
       --  Number of Coroutine handles naming this slot. Once it reaches 0 the
       --  slot is released.
+      --
+      --  Atomic, because a handle may legitimately be copied and dropped on a
+      --  task other than the coroutine's owner: reference counting is about
+      --  lifetime, not scheduling, so affinity deliberately does not guard it.
+      --  See Minicoro.Atomics for why it is a private type rather than an
+      --  Atomic scalar.
 
       In_Use     : Boolean := False;
       --  Whether this slot holds a coroutine at all. A released slot reads as
@@ -59,11 +82,22 @@ is
       Parent     : Slot_Id := No_Slot;
       --  Slot that created this one. Used to resume execution after
       --  completion. Counted: Create bumps it, Release drops it.
+      --
+      --  A lifetime link, not a scheduling one, which is why Detach leaves it
+      --  alone: a coroutine that moves to another task keeps its parent
+      --  alive, but the completion walk in Coroutine_Wrapper skips ancestors
+      --  the running task does not own.
+
+      Owner      : Owner_Id := No_Owner;
+      --  Which task may spawn, switch to or kill this slot. No_Owner means
+      --  detached. Kept here rather than read back out of Minicoro because a
+      --  slot that has not been spawned yet has no Minicoro coroutine to ask,
+      --  and a task's own main slot never has one at all.
 
       Coro       : Minicoro.Coroutine_Id := Minicoro.No_Coroutine;
       --  Backing coroutine in the Minicoro pool, or No_Coroutine when this
-      --  one is not spawned. The main coroutine is always No_Coroutine: that
-      --  id names the thread's own context.
+      --  one is not spawned. A task's own main coroutine is always
+      --  No_Coroutine: that id names the calling thread's own context.
 
       Sec_Stack  : System.Secondary_Stack.SS_Stack_Ptr := null;
       --  Saved coroutine-specific secondary stack.
@@ -96,12 +130,20 @@ is
    --  the running coroutine by index, so an array indexed by that is all it
    --  takes, and no address is ever formed -- which is why that field, and
    --  the observer that read it, are gone from Minicoro entirely.
+   --
+   --  Shared across tasks, and safely so: a Minicoro id belongs to exactly
+   --  one slot, and a slot to at most one task, so no two tasks ever write
+   --  the same element.
 
-   Previous_Slot : Slot_Id := Main_Slot;
+   Previous_Slot : array (Valid_Owner) of Slot_Id := [others => No_Slot];
+   --  Per task: from the next coroutine to run's point of view, what the
+   --  current one was. One variable would have made every task's switches
+   --  overwrite every other task's.
 
-   Booted : Boolean := False;
-   --  Whether Main_Slot has been claimed. Done lazily rather than at
-   --  elaboration so that nothing here depends on elaboration order.
+   Booted : array (Valid_Owner) of Boolean := [others => False];
+   --  Whether this task's main slot has been claimed. Done lazily rather than
+   --  at elaboration so that nothing here depends on elaboration order, and
+   --  because a task that never calls in should not cost a slot.
 
    ---------
    -- Raw --
@@ -155,6 +197,12 @@ is
       --  call is a dereference SPARK wants proved non-null, and the target's
       --  effects are invisible to it. Both facts are about the runtime's
       --  internals rather than about this package, so they live here.
+      --
+      --  These are also the one part of this package that was already
+      --  per-task before affinity existed: in a tasking runtime the soft
+      --  links are per-task, so each task saves and restores its own
+      --  secondary stack, and a coroutine carries its own in its slot when it
+      --  moves.
       --  Run the slot's delegate and absorb whatever escapes it: a kill
       --  becomes To_Previous, anything else is parked in the slot to be
       --  re-raised in whoever resumes next. Outside SPARK for the same
@@ -182,8 +230,9 @@ is
      with Exceptional_Cases => (others => True);
    --  Last handle gone: kill if needed, free the delegate, clear the slot.
 
-   procedure Ensure_Booted;
-   function Current_Slot return Valid_Slot;
+   procedure Ensure_Booted (O : out Owner_Id; Ok : out Boolean);
+   function Main_Slot_Of (O : Valid_Owner) return Task_Slot;
+   function Current_Slot (O : Valid_Owner) return Valid_Slot;
    function Alive_Slot (Slot : Slot_Id) return Boolean;
    procedure Switch_Slot (Slot : Valid_Slot)
      with Exceptional_Cases => (others => True);
@@ -193,6 +242,8 @@ is
      (Slot       : Valid_Slot;
       Stack_Size : System.Storage_Elements.Storage_Offset)
      with Exceptional_Cases => (Coroutine_Error => True);
+   procedure Detach_Slot (Slot : Valid_Slot; Res : out Minicoro.Result);
+   procedure Adopt_Slot (Slot : Valid_Slot; Res : out Minicoro.Result);
 
    ---------
    -- Raw --
@@ -272,39 +323,63 @@ is
 
    end Raw;
 
-   --------------------
-   -- Ensure_Booted --
-   --------------------
+   ------------------
+   -- Main_Slot_Of --
+   ------------------
 
-   procedure Ensure_Booted is
+   function Main_Slot_Of (O : Valid_Owner) return Task_Slot is
+     (Task_Slot (O));
+   --  The reservation is by construction rather than by search: task number
+   --  N owns slot N. Nothing has to be allocated, so two tasks booting at
+   --  once cannot pick the same slot.
+
+   -------------------
+   -- Ensure_Booted --
+   -------------------
+
+   procedure Ensure_Booted (O : out Owner_Id; Ok : out Boolean) is
+      Res  : Minicoro.Result;
+      Slot : Task_Slot;
    begin
-      if Booted then
+      --  Minicoro numbers the calling thread and adopts its stack. Both are
+      --  idempotent and both are needed before this package can name the
+      --  task's own main coroutine.
+      Minicoro.Register (O, Res);
+      Ok := Res = Minicoro.Success and then O in Valid_Owner;
+      if not Ok then
          return;
       end if;
-      Pool (Main_Slot).Ref_Count  := 1;
-      Pool (Main_Slot).In_Use     := True;
-      Pool (Main_Slot).Is_Main    := True;
-      Pool (Main_Slot).Is_Started := True;
-      Pool (Main_Slot).Parent     := No_Slot;
-      Previous_Slot := Main_Slot;
-      Booted := True;
+
+      if Booted (O) then
+         return;
+      end if;
+
+      Slot := Main_Slot_Of (O);
+      Atomics.Reset (Pool (Slot).Ref_Count, 1);
+      Pool (Slot).In_Use     := True;
+      Pool (Slot).Is_Main    := True;
+      Pool (Slot).Is_Started := True;
+      Pool (Slot).Parent     := No_Slot;
+      Pool (Slot).Owner      := O;
+      Previous_Slot (O) := Slot;
+      Booted (O) := True;
    end Ensure_Booted;
 
    ------------------
    -- Current_Slot --
    ------------------
 
-   function Current_Slot return Valid_Slot is
+   function Current_Slot (O : Valid_Owner) return Valid_Slot is
       Running : constant Minicoro.Coroutine_Id := Minicoro.Running_Coroutine;
    begin
-      --  Minicoro names the thread's own context No_Coroutine, which is
-      --  exactly this package's main coroutine.
+      --  Minicoro names the calling thread's own context No_Coroutine, which
+      --  is exactly this package's main coroutine for that task.
       if Running = Minicoro.No_Coroutine then
-         return Main_Slot;
+         return Main_Slot_Of (O);
       elsif By_Coro (Running) in Valid_Slot then
          return By_Coro (Running);
       else
-         return Main_Slot;
+         return Main_Slot_Of (O);
       end if;
    end Current_Slot;
 
@@ -317,8 +392,8 @@ is
         and then Pool (Slot).In_Use
         and then (Pool (Slot).Is_Main
                   or else Pool (Slot).Coro /= Minicoro.No_Coroutine));
-   --  The main coroutine is always alive: it is the thread itself, and it has
-   --  no pool slot in Minicoro to hold.
+   --  A task's main coroutine is always alive: it is the task itself, and it
+   --  has no pool slot in Minicoro to hold.
 
    ----------
    -- Bump --
@@ -326,10 +401,8 @@ is
 
    procedure Bump (C : in out Coroutine) is
    begin
-      if C.Slot in Valid_Slot
-        and then Pool (C.Slot).Ref_Count < Natural'Last
-      then
-         Pool (C.Slot).Ref_Count := Pool (C.Slot).Ref_Count + 1;
+      if C.Slot in Valid_Slot then
+         Atomics.Increment (Pool (C.Slot).Ref_Count);
       end if;
    end Bump;
 
@@ -338,7 +411,8 @@ is
    ----------
 
    procedure Drop (C : in out Coroutine) is
-      Slot : constant Slot_Id := C.Slot;
+      Slot     : constant Slot_Id := C.Slot;
+      Was_Last : Boolean;
    begin
       --  Clear the handle before doing anything else. Releasing a slot can
       --  run user finalization, which may look at this very handle; and a
@@ -346,13 +420,18 @@ is
       --  means someone up the stack is already releasing this slot.
       C.Slot := No_Slot;
 
-      if Slot not in Valid_Slot or else Pool (Slot).Ref_Count = 0 then
+      if Slot not in Valid_Slot then
          return;
       end if;
 
-      Pool (Slot).Ref_Count := Pool (Slot).Ref_Count - 1;
+      --  Was_Last, not a re-read of the count. If two tasks drop the last two
+      --  handles at once, both would see zero on a re-read and both would try
+      --  to release the slot; exactly one of them gets Was_Last here. A count
+      --  already at zero reports False, which is the reference-loop case the
+      --  comment above describes.
+      Atomics.Decrement (Pool (Slot).Ref_Count, Was_Last);
 
-      if Pool (Slot).Ref_Count = 0 and then Slot /= Main_Slot then
+      if Was_Last and then Slot not in Task_Slot then
          Release (Slot);
       end if;
    exception
@@ -371,10 +450,48 @@ is
    -------------
 
    procedure Release (Slot : Valid_Slot) is
-      Parent : constant Slot_Id := Pool (Slot).Parent;
+      Parent       : constant Slot_Id := Pool (Slot).Parent;
+      O            : Owner_Id;
+      Ok           : Boolean;
+      Res          : Minicoro.Result;
+      Parent_Freed : Boolean;
    begin
-      if Alive_Slot (Slot) then
-         Kill_Slot (Slot);
+      Ensure_Booted (O, Ok);
+
+      if Ok and then Alive_Slot (Slot) then
+         --  A detached coroutine has no owner to unwind it, so take it back
+         --  first: adopting costs nothing and lets Kill_Slot raise
+         --  Abort_Coroutine inside it in the ordinary way, so its stack
+         --  unwinds and its finalizers run.
+         if Pool (Slot).Owner = No_Owner then
+            Adopt_Slot (Slot, Res);
+            --  Res is deliberately not tested. The only thing that matters is
+            --  whether we now own the slot, which the next line asks
+            --  directly; a failed adoption falls into the branch below, which
+            --  is where anything we cannot unwind belongs anyway.
+         end if;
+
+         if Pool (Slot).Owner = O then
+            Kill_Slot (Slot);
+         else
+            --  Not ours: either the slot belongs to another live task, or it
+            --  was detached and we could not take it (the task ceiling). We
+            --  cannot switch into it from here, so it cannot be unwound; the
+            --  slot is cleared but its stack is left alone rather than freed
+            --  under a task that may be a switch away from standing on it.
+            --  Dropping the last handle to a coroutine that belongs to
+            --  another task is a programming error -- see "Task affinity" in
+            --  the spec -- and leaking a stack is the safe way to lose that
+            --  race.
+            Reset_Foreign : declare
+               Coro : constant Minicoro.Coroutine_Id := Pool (Slot).Coro;
+            begin
+               if Coro /= Minicoro.No_Coroutine then
+                  By_Coro (Coro) := No_Slot;
+               end if;
+            end Reset_Foreign;
+            Pool (Slot).Coro := Minicoro.No_Coroutine;
+         end if;
       end if;
 
       Raw.Free_Delegate (Slot);
@@ -384,14 +501,20 @@ is
       Pool (Slot).Is_Main    := False;
       Pool (Slot).Is_Started := False;
       Pool (Slot).To_Clean   := False;
+      Pool (Slot).Owner      := No_Owner;
       Pool (Slot).Coro       := Minicoro.No_Coroutine;
       Save_Occurrence (Excs (Slot), Null_Occurrence);
 
       --  Drop the counted reference this slot held on its parent. Done last,
       --  and iteratively rather than by recursion, so that a long ancestor
       --  chain cannot recurse arbitrarily deep.
-      if Parent in Valid_Slot and then Pool (Parent).Ref_Count > 0 then
-         Pool (Parent).Ref_Count := Pool (Parent).Ref_Count - 1;
+      if Parent in Valid_Slot then
+         Atomics.Decrement (Pool (Parent).Ref_Count, Parent_Freed);
+         --  Deliberately not chased. Releasing the parent from here would
+         --  recurse up an arbitrarily long ancestor chain, which is the thing
+         --  the original comment above is about; the parent is released by
+         --  whoever drops its last *handle*, and this only removes the claim
+         --  this child had on it.
       end if;
    end Release;
 
@@ -433,17 +556,24 @@ is
    procedure Claim_Slot (Slot : out Slot_Id);
    --  Everything Create does apart from adopting the delegate. Split out so
    --  that the part which can be analysed is. No explicit Global: it would
-   --  have to name Minicoro.Current_State, which Current_Slot reads through
+   --  have to name Minicoro's states, which Current_Slot reads through
    --  Minicoro.Running_Coroutine, and inference gets it right.
 
    procedure Claim_Slot (Slot : out Slot_Id) is
       Parent : Valid_Slot;
+      Owner  : Owner_Id;
+      Ok     : Boolean;
    begin
       Slot := No_Slot;
-      Ensure_Booted;
-      Parent := Current_Slot;
+      Ensure_Booted (Owner, Ok);
+      if not Ok then
+         return;
+      end if;
+      Parent := Current_Slot (Owner);
 
-      for I in Valid_Slot loop
+      --  User coroutines come out of User_Slot only: the low slots are spoken
+      --  for, one per task, and are never allocated from.
+      for I in User_Slot loop
          if not Pool (I).In_Use then
             Slot := I;
             exit;
@@ -460,9 +590,10 @@ is
          return;
       end if;
 
-      Pool (Slot).Ref_Count  := 1;
+      Atomics.Reset (Pool (Slot).Ref_Count, 1);
       Pool (Slot).In_Use     := True;
       Pool (Slot).Parent     := Parent;
+      Pool (Slot).Owner      := Owner;
       Pool (Slot).Coro       := Minicoro.No_Coroutine;
       Pool (Slot).Sec_Stack  := null;
       Pool (Slot).Is_Main    := False;
@@ -472,11 +603,21 @@ is
 
       --  The new slot holds a counted reference on its parent, so the parent
       --  cannot be released while a child still names it.
-      if Pool (Parent).Ref_Count < Natural'Last then
-         Pool (Parent).Ref_Count := Pool (Parent).Ref_Count + 1;
-      end if;
+      Atomics.Increment (Pool (Parent).Ref_Count);
 
    end Claim_Slot;
+
+   procedure Create (C : out Coroutine; D : Delegate_Access) is
+      Slot : Slot_Id;
+   begin
+      C := Null_Coroutine;
+      Claim_Slot (Slot);
+      if Slot not in Valid_Slot then
+         return;
+      end if;
+      Raw.Adopt_Delegate (Slot, D);
+      C := (Slot => Slot);
+   end Create;
 
    function Create (D : Delegate_Access) return Coroutine is
       pragma SPARK_Mode (Off);
@@ -508,6 +649,149 @@ is
 
    function Alive (C : Coroutine) return Boolean is (Alive_Slot (C.Slot));
 
+   -----------------------------
+   -- Owned_By_Current_Task --
+   -----------------------------
+
+   function Owned_By_Current_Task (C : Coroutine) return Boolean is
+     (C.Slot in Valid_Slot
+        and then Pool (C.Slot).In_Use
+        and then Minicoro.Current_Owner /= No_Owner
+        and then Pool (C.Slot).Owner = Minicoro.Current_Owner);
+
+   -----------------
+   -- Is_Detached --
+   -----------------
+
+   function Is_Detached (C : Coroutine) return Boolean is
+     (C.Slot in Valid_Slot
+        and then Pool (C.Slot).In_Use
+        and then Pool (C.Slot).Owner = No_Owner);
+
+   -----------------
+   -- Detach_Slot --
+   -----------------
+
+   procedure Detach_Slot (Slot : Valid_Slot; Res : out Minicoro.Result) is
+      O  : Owner_Id;
+      Ok : Boolean;
+   begin
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         Res := Minicoro.Too_Many_Tasks;
+         return;
+      end if;
+
+      if Slot in Task_Slot then
+         --  A task's own main coroutine *is* the task. There is no stack to
+         --  hand over that the other task could run on.
+         Res := Minicoro.Invalid_Operation;
+         return;
+      end if;
+
+      if Pool (Slot).Owner /= O then
+         Res := Minicoro.Wrong_Task;
+         return;
+      end if;
+
+      if Slot = Current_Slot (O) then
+         Res := Minicoro.Coroutine_Busy;
+         return;
+      end if;
+
+      --  An unspawned slot has no Minicoro coroutine, and detaching it is
+      --  just a change of owner: the adopting task is then the one that may
+      --  Spawn it. A spawned one has to pass Minicoro's own checks first,
+      --  which are the ones that know about resume chains.
+      if Pool (Slot).Coro /= Minicoro.No_Coroutine then
+         Minicoro.Detach (Pool (Slot).Coro, Res);
+         if Res /= Minicoro.Success then
+            return;
+         end if;
+      end if;
+
+      --  Forget it as this task's "previously running". Left set, the
+      --  post-switch cleanup in Switch_Slot would go looking at a slot that
+      --  now belongs to somebody else.
+      if Previous_Slot (O) = Slot then
+         Previous_Slot (O) := No_Slot;
+      end if;
+
+      Pool (Slot).Owner := No_Owner;
+      Res := Minicoro.Success;
+   end Detach_Slot;
+
+   ----------------
+   -- Adopt_Slot --
+   ----------------
+
+   procedure Adopt_Slot (Slot : Valid_Slot; Res : out Minicoro.Result) is
+      O  : Owner_Id;
+      Ok : Boolean;
+   begin
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         Res := Minicoro.Too_Many_Tasks;
+         return;
+      end if;
+
+      if Pool (Slot).Owner /= No_Owner then
+         Res := Minicoro.Wrong_Task;
+         return;
+      end if;
+
+      if Pool (Slot).Coro /= Minicoro.No_Coroutine then
+         Minicoro.Adopt (Pool (Slot).Coro, Res);
+         if Res /= Minicoro.Success then
+            return;
+         end if;
+      end if;
+
+      Pool (Slot).Owner := O;
+      Res := Minicoro.Success;
+   end Adopt_Slot;
+
+   ------------
+   -- Detach --
+   ------------
+
+   procedure Detach (C : Coroutine) is
+      pragma SPARK_Mode (Off);
+      --  Off: as Spawn. A dispatching operation cannot carry
+      --  Exceptional_Cases. The work is in Detach_Slot, which is analysed.
+      Res : Minicoro.Result;
+   begin
+      if C.Slot not in Valid_Slot or else not Pool (C.Slot).In_Use then
+         raise Coroutine_Error with "uninitialized coroutine";
+      end if;
+
+      Detach_Slot (C.Slot, Res);
+      if Res /= Minicoro.Success then
+         raise Coroutine_Error
+           with "Detach failed: " & Minicoro.Result'Image (Res);
+      end if;
+   end Detach;
+
+   -----------
+   -- Adopt --
+   -----------
+
+   procedure Adopt (C : Coroutine) is
+      pragma SPARK_Mode (Off);
+      --  Off: as Detach.
+      Res : Minicoro.Result;
+   begin
+      if C.Slot not in Valid_Slot or else not Pool (C.Slot).In_Use then
+         raise Coroutine_Error with "uninitialized coroutine";
+      end if;
+
+      Adopt_Slot (C.Slot, Res);
+      if Res /= Minicoro.Success then
+         raise Coroutine_Error
+           with "Adopt failed: " & Minicoro.Result'Image (Res);
+      end if;
+   end Adopt;
+
    -----------
    -- Spawn --
    -----------
@@ -536,13 +820,23 @@ is
      (Slot       : Valid_Slot;
       Stack_Size : System.Storage_Elements.Storage_Offset)
    is
-      Coro : Minicoro.Coroutine_Id;
-      Res  : Minicoro.Result;
+      Coro  : Minicoro.Coroutine_Id;
+      Res   : Minicoro.Result;
+      Owner : Owner_Id;
+      Ok    : Boolean;
    begin
-      Ensure_Booted;
+      Ensure_Booted (Owner, Ok);
+      if not Ok then
+         raise Coroutine_Error with "too many tasks";
+      end if;
 
       if Alive_Slot (Slot) then
          raise Coroutine_Error with "Coroutine already spawed";
+      end if;
+
+      if Pool (Slot).Owner /= Owner then
+         raise Coroutine_Error
+           with "Coroutine belongs to another task";
       end if;
 
       --  Storage_Offset is signed and far wider than Stack_Count, so the
@@ -596,25 +890,33 @@ is
 
    procedure Switch_Slot (Slot : Valid_Slot) is
       Res : Minicoro.Result;
+      O   : Owner_Id;
+      Ok  : Boolean;
       Cur : Valid_Slot;
    begin
-      Ensure_Booted;
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         raise Coroutine_Error with "too many tasks";
+      end if;
 
-      if Slot = Current_Slot then
+      if Slot = Current_Slot (O) then
          raise Coroutine_Error with "Trying to switch to the same coroutine";
       elsif not Alive_Slot (Slot) then
          raise Coroutine_Error with "Trying to switch to a dead coroutine";
+      elsif Pool (Slot).Owner /= O then
+         raise Coroutine_Error
+           with "Trying to switch to a coroutine of another task";
       end if;
 
       --  From the next coroutine to run's point of view, the current
       --  coroutine is what Previous_Slot shall be.
-      Cur := Current_Slot;
+      Cur := Current_Slot (O);
       Raw.Save_Sec_Stack (Cur);
-      Previous_Slot := Cur;
+      Previous_Slot (O) := Cur;
 
       --  A symmetric transfer, as PCL's co_call was: the target may be this
       --  coroutine's parent, a sibling, or the main context, and it resumes
-      --  wherever it last stopped. Coro is No_Coroutine for the main
+      --  wherever it last stopped. Coro is No_Coroutine for a task's main
       --  coroutine, which is exactly how Minicoro names the thread context.
       Minicoro.Switch_To (Pool (Slot).Coro, Res);
       if Res /= Minicoro.Success then
@@ -622,14 +924,27 @@ is
            with "Switch failed: " & Minicoro.Result'Image (Res);
       end if;
 
-      Cur := Current_Slot;
+      --  Re-read the task number rather than reusing the one from above.
+      --  This invocation lives on some coroutine's stack, and that coroutine
+      --  may have been Detached and Adopted by another task while it was
+      --  parked here -- which is the whole point of the feature. The switch
+      --  itself never changes threads, but the gap between switching out and
+      --  being switched back in can. Everything below indexes per-task state,
+      --  so it has to be the task we are actually on.
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         raise Coroutine_Error with "too many tasks";
+      end if;
+
+      Cur := Current_Slot (O);
       Raw.Restore_Sec_Stack (Cur);
 
-      if Previous_Slot in Valid_Slot and then Pool (Previous_Slot).To_Clean
+      if Previous_Slot (O) in Valid_Slot
+        and then Pool (Previous_Slot (O)).To_Clean
       then
-         Reset (Previous_Slot);
-         if not Is_Null_Occurrence (Excs (Previous_Slot)) then
-            Reraise_And_Clean (Previous_Slot);
+         Reset (Previous_Slot (O));
+         if not Is_Null_Occurrence (Excs (Previous_Slot (O))) then
+            Reraise_And_Clean (Previous_Slot (O));
          end if;
       end if;
 
@@ -657,13 +972,20 @@ is
    ---------------
 
    procedure Kill_Slot (Slot : Valid_Slot) is
+      O  : Owner_Id;
+      Ok : Boolean;
    begin
-      Ensure_Booted;
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         raise Coroutine_Error with "too many tasks";
+      end if;
 
-      if Slot = Main_Slot then
+      if Slot in Task_Slot then
          raise Coroutine_Error with "Cannot kill the main coroutine";
       elsif not Alive_Slot (Slot) then
          raise Coroutine_Error with "Coroutine already killed";
+      elsif Pool (Slot).Owner /= O then
+         raise Coroutine_Error with "Coroutine belongs to another task";
       end if;
 
       if not Pool (Slot).Is_Started then
@@ -683,17 +1005,35 @@ is
    -- Current_Coroutine --
    -----------------------
 
+   procedure Current_Coroutine (C : out Coroutine) is
+      Slot : Valid_Slot;
+      O    : Owner_Id;
+      Ok   : Boolean;
+   begin
+      C := Null_Coroutine;
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         return;
+      end if;
+      Slot := Current_Slot (O);
+      Atomics.Increment (Pool (Slot).Ref_Count);
+      C := (Slot => Slot);
+   end Current_Coroutine;
+
    function Current_Coroutine return Coroutine is
       pragma SPARK_Mode (Off);
       --  Off: a SPARK function may not write globals, and handing out a
       --  reference has to count it.
       Slot : Valid_Slot;
+      O    : Owner_Id;
+      Ok   : Boolean;
    begin
-      Ensure_Booted;
-      Slot := Current_Slot;
-      if Pool (Slot).Ref_Count < Natural'Last then
-         Pool (Slot).Ref_Count := Pool (Slot).Ref_Count + 1;
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         return Null_Coroutine;
       end if;
+      Slot := Current_Slot (O);
+      Atomics.Increment (Pool (Slot).Ref_Count);
       return (Slot => Slot);
    end Current_Coroutine;
 
@@ -701,15 +1041,35 @@ is
    -- Main_Coroutine --
    --------------------
 
+   procedure Main_Coroutine (C : out Coroutine) is
+      Slot : Task_Slot;
+      O    : Owner_Id;
+      Ok   : Boolean;
+   begin
+      C := Null_Coroutine;
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         return;
+      end if;
+      Slot := Main_Slot_Of (O);
+      Atomics.Increment (Pool (Slot).Ref_Count);
+      C := (Slot => Slot);
+   end Main_Coroutine;
+
    function Main_Coroutine return Coroutine is
       pragma SPARK_Mode (Off);
       --  Off: as Current_Coroutine.
+      Slot : Task_Slot;
+      O    : Owner_Id;
+      Ok   : Boolean;
    begin
-      Ensure_Booted;
-      if Pool (Main_Slot).Ref_Count < Natural'Last then
-         Pool (Main_Slot).Ref_Count := Pool (Main_Slot).Ref_Count + 1;
+      Ensure_Booted (O, Ok);
+      if not Ok then
+         return Null_Coroutine;
       end if;
-      return (Slot => Main_Slot);
+      Slot := Main_Slot_Of (O);
+      Atomics.Increment (Pool (Slot).Ref_Count);
+      return (Slot => Slot);
    end Main_Coroutine;
 
    -----------------------
@@ -720,6 +1080,8 @@ is
       Slot        : Valid_Slot;
       To_Previous : Boolean;
       Ancestor    : Slot_Id;
+      O           : Owner_Id;
+      Ok          : Boolean;
    begin
       if By_Coro (Self) not in Valid_Slot then
          --  Cannot happen: Spawn_Slot records the mapping before anything can
@@ -749,24 +1111,40 @@ is
       --  the switches are wrapped, and a failure falls through to the same
       --  terminal spin as every other way of having nowhere to go.
       begin
-         if To_Previous and then Previous_Slot in Valid_Slot then
-            Switch_Slot (Previous_Slot);
+         Ensure_Booted (O, Ok);
+         if not Ok then
+            raise Coroutine_Error with "too many tasks";
          end if;
 
-         --  Get the nearest parent coroutine still alive and resume execution
-         --  in it. The walk is bounded by the pool size: a chain longer than
-         --  that would have to revisit a slot, and there is nowhere left to
-         --  go.
+         if To_Previous
+           and then Previous_Slot (O) in Valid_Slot
+           and then Pool (Previous_Slot (O)).Owner = O
+         then
+            Switch_Slot (Previous_Slot (O));
+         end if;
+
+         --  Get the nearest parent coroutine still alive *and belonging to
+         --  the task we are running on*, and resume execution in it. The
+         --  owner test is what a moved coroutine needs: its parent chain
+         --  still points back into the task that created it, and switching
+         --  there would install another task's stack. The walk is bounded by
+         --  the pool size: a chain longer than that would have to revisit a
+         --  slot, and there is nowhere left to go.
          Ancestor := Pool (Slot).Parent;
          for Unused in Valid_Slot loop
-            exit when Ancestor not in Valid_Slot or else Alive_Slot (Ancestor);
+            exit when Ancestor not in Valid_Slot
+              or else (Alive_Slot (Ancestor)
+                       and then Pool (Ancestor).Owner = O);
             Ancestor := Pool (Ancestor).Parent;
          end loop;
 
-         if Ancestor in Valid_Slot and then Alive_Slot (Ancestor) then
+         if Ancestor in Valid_Slot
+           and then Alive_Slot (Ancestor)
+           and then Pool (Ancestor).Owner = O
+         then
             Switch_Slot (Ancestor);
          else
-            Switch_Slot (Main_Slot);
+            Switch_Slot (Main_Slot_Of (O));
          end if;
       exception
          when others =>

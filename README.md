@@ -50,7 +50,7 @@ $ alr test
 ```
 
 That builds everything and then runs `run_tests.py`, which reports one verdict
-per case — 27 in total: 2 in `minicoro/tests`, 17 in `coroutines/tests` and 8
+per case — 33 in total: 2 in `minicoro/tests`, 21 in `coroutines/tests` and 10
 in `generators/tests`. `alr` writes the report to
 `alire/alr_test_local.log`; run `python3 run_tests.py` directly to watch it
 live.
@@ -85,7 +85,7 @@ Generator_Slots         SPARK   generator ref counting + slot lifecycle
 Generators              SPARK   except the iteration interface
 ```
 
-All of `minicoro/` is `SPARK_Mode => On` except six subprograms, each marked
+All of `minicoro/` is `SPARK_Mode => On` except eight subprograms, each marked
 and justified where it sits: the two `Unchecked_Conversion`s that turn a
 code-page address into a callable switch routine and a coroutine body into a
 machine word, the indirect call itself, `Make_Context`'s overlay write,
@@ -171,8 +171,8 @@ What is proved and what is assumed
 ----------------------------------
 
 Being precise about this matters more than the headline number, which is
-`Success: all checks proved` — 490 checks for `minicoro`, 646 for
-`coroutines` and 648 for `generators`, each figure including the layers below
+`Success: all checks proved` — 612 checks for `minicoro`, 829 for
+`coroutines` and 856 for `generators`, each figure including the layers below
 it since the projects with each other. The full run is 351 run-time checks,
 112 functional contracts, 19 assertions, 72 termination checks and the flow
 analysis, with two justifications (see below) and nothing unproved.
@@ -252,20 +252,30 @@ ninth true of the whole library:
 8. **The GNAT secondary stack and soft links behave.** Saving, restoring and
    initialising a coroutine's secondary stack goes through
    `System.Soft_Links`, whose effects SPARK cannot see.
-9. **One thread of control.** This is the largest assumption of the lot and
-   the one least visible in the source. Every check above is proved for a
-   single-threaded program: the pools, the "currently running" coroutine and
-   the adopted main context are all unsynchronised globals, and the library
-   contains no `task`, `protected` or `Atomic` construct anywhere. Two Ada
-   tasks reaching it would race on all of it, and the first symptom would be
-   silent — a task switching onto a stack pointer another task adopted.
+9. **One thread of control, per proof.** Every check above is proved of a
+   single thread. That is now a weaker statement than it used to be, because
+   the state that made it load-bearing is no longer shared: the main context,
+   the running coroutine and the backend-up flag are arrays indexed by a
+   thread number, and each coroutine records which thread may switch to it,
+   so the classic failure — a task installing a stack pointer another task
+   adopted — is refused with `Wrong_Task` instead of corrupting memory.
 
-   For SPARK clients this is enforced rather than merely assumed: with
-   `pragma Profile (Ravenscar)` and `Partition_Elaboration_Policy
-   (Sequential)`, GNATprove reports `possible data race when accessing
-   variable "minicoro.pool"` and refuses. An ordinary Ada client gets no
-   such diagnostic. See "Threading model" in `CLAUDE.md`, which also records
-   why per-task pools are not currently available.
+   What is assumed is the step from "proved of one thread" to "holds of each
+   thread separately". GNATprove does not model `pragma
+   Thread_Local_Storage`; it says so (`pragma "Thread_Local_Storage" ignored
+   (not yet supported)`) and analyses the thread number as an ordinary
+   variable. Also outside the proof: the single atomic fetch-and-add that
+   hands those numbers out, and `Trampoline`'s claim that whichever thread
+   finishes a coroutine has its own backend up.
+
+   Reference counts *are* atomic, so handles may be copied and dropped on
+   any task; what remains unsynchronised is concurrent `Create`, which finds
+   a free slot by scanning the shared pool and then marking it. For SPARK
+   clients that residue
+   is reported rather than assumed: with `pragma Profile (Ravenscar)` and
+   `Partition_Elaboration_Policy (Sequential)`, GNATprove says `possible data
+   race when accessing variable "minicoro.pool"`. See "Threading model" in
+   `CLAUDE.md` for the full boundary and what the caller must arrange.
 
 The **justified** checks are two, both written out with `pragma Annotate` at
 the site and both showing up in GNATprove's report rather than being silently
@@ -293,6 +303,15 @@ Design notes
   dangling access value. The cost is a compile-time maximum
   (`Max_Coroutines`, default 64); coroutine *stacks* are still allocated
   dynamically.
+* **A coroutine belongs to one task.** Switching to a stackful coroutine
+  installs its saved stack pointer on the calling thread, so two threads
+  switching to one coroutine run on one stack. Each coroutine therefore
+  records an owner, every control transfer checks it, and `Detach`/`Adopt`
+  hand one over — which is also what makes work stealing possible: a detached
+  coroutine is a unit of work any task may pick up. A thread's own number is
+  one thread-local scalar, so the check costs a `%fs`-relative load and a
+  compare and a program with no tasks pays nothing more. `Minicoro.Max_Owners`
+  (16) is the ceiling on threads.
 * **Layout has one source of truth.** `Machine_Code.Layout` gives the byte
   offsets of the saved-register buffer; the generated code indexes through
   those constants and `Contexts.Context` pins its representation clause to the

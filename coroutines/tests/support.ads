@@ -19,4 +19,17 @@ package Support is
 
    overriding procedure Run (D : in out Hello_World_Delegate);
 
+   type Stepper is new Coroutines.Delegate with record
+      Steps : Natural := 0;
+      --  How many times to stop and hand control back.
+   end record;
+   --  Coroutine delegate that announces each step and then switches back to
+   --  the main coroutine *of whichever task is running it*, rather than to a
+   --  caller captured when it was created. That is what makes it usable
+   --  across a move: Coroutines.Main_Coroutine is per task, so the coroutine
+   --  always hands control to a coroutine the running task owns, and picks up
+   --  at the next step whoever switches into it next.
+
+   overriding procedure Run (D : in out Stepper);
+
 end Support;

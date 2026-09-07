@@ -11,6 +11,7 @@ A prototype for Ada generators/coroutines, in four layers, bottom up:
 | Directory     | Unit                    | SPARK | Role                                        |
 |---------------|-------------------------|-------|---------------------------------------------|
 | `minicoro/`   | `Minicoro`              | yes*  | coroutine lifecycle + per-coroutine byte stack |
+|               | `Minicoro.Atomics`       | yes*  | atomic reference count for the layers above  |
 |               | `Minicoro.Machine_Code`  | yes   | x86-64 instruction encoder, switch listing  |
 |               | `Minicoro.FTAL`          | yes   | ghost register/stack typing model (all Ghost) |
 |               | `Minicoro.Contexts`      | yes*  | **private child**; trusted context switch   |
@@ -22,8 +23,13 @@ A prototype for Ada generators/coroutines, in four layers, bottom up:
 `yes*` means the unit is `SPARK_Mode => On` with named exceptions inside it,
 each marked and justified where it sits.
 
+Coroutines and generators carry **task affinity**: one belongs to a single
+task, only that task may transfer control to it, and `Detach`/`Adopt` move it
+to another. That is a property of all three layers and is described in one
+place, "Threading model".
+
 No package in the tree is `SPARK_Mode => Off`, and all three proof runs are
-clean: `minicoro/` 490 checks, `coroutines/` 646, `generators/` 648 — each
+clean: `minicoro/` 612 checks, `coroutines/` 829, `generators/` 856 — each
 figure including the layers below it, since the projects with each other —
 all with 2 justified and **0 unproved**.
 
@@ -34,7 +40,7 @@ aspect names the three `Off` functions that advance a generator). Left as one
 package it produced literally zero checks. Splitting the `T`-independent
 half — reference counting, slot allocation, the execution state machine —
 into the non-generic `Generator_Slots` sidesteps that entirely: non-generic
-packages are analysed directly. 27 of the 648 checks are its own — five of
+packages are analysed directly. 27 of the 856 checks are its own — five of
 them postconditions, on `Claim`, `Bump`, `Drop`, `Set_State` and
 `Set_Owns_Delegate` — and they are the ones where a generator bug would
 live.
@@ -85,7 +91,17 @@ alr test      # builds, then runs run_tests.py
 if you want to watch it. Either way the runner reports one verdict per case
 and exits non-zero on any failure.
 
-Expected: **2/2 minicoro, 17/17 coroutines, 8/8 generators — 27 in all.**
+Expected: **2/2 minicoro, 21/21 coroutines, 10/10 generators — 33 in all.**
+
+The six newest cases are the task-affinity ones and each uses real Ada
+tasks: `coroutines/tests/test_task_affinity`,
+`coroutines/tests/test_continue_after_move`,
+`coroutines/tests/test_too_many_tasks`,
+`coroutines/tests/test_shared_refcount`,
+`generators/tests/test_work_stealing` and
+`generators/tests/test_migrate_midway`. They are golden-output cases like
+the rest, and they are deterministic on purpose — nothing they print
+depends on which task wins a race. See "Threading model".
 
 `run_tests.py` normalises output to LF before comparing against `ref/`. The
 per-suite `run.py` drivers still exist and still compare raw bytes, which is
@@ -109,15 +125,15 @@ cd minicoro    && gnatprove -P minicoro.gpr    --level=2 -j4 --report=fail
 cd coroutines  && gnatprove -P coroutines.gpr  --level=2 -j4 --report=fail
 ```
 
-Expected: `Success: all checks proved (490 checks)` for `minicoro` and
-`(646 checks)` for `coroutines`, each with **2 justified, 0 unproved**. The
+Expected: `Success: all checks proved (612 checks)` for `minicoro` and
+`(829 checks)` for `coroutines`, each with **2 justified, 0 unproved**. The
 second figure includes the first: `coroutines.gpr` withs `minicoro.gpr`, so
 that run re-analyses everything and is the one to trust if you only run one.
 ```sh
 cd generators  && gnatprove -P generators.gpr  --level=2 -j4 --report=fail
 ```
 
-Expected there: `Success: all checks proved (648 checks)`, 2 justified, 0
+Expected there: `Success: all checks proved (856 checks)`, 2 justified, 0
 unproved. That run covers all three layers, so it is the single command to
 use if you only run one.
 
@@ -132,14 +148,55 @@ Push's capacity guard still produces `array index check might fail`,
 make a change that drops the count again, do the same: a smaller number and
 "all checks proved" is also what losing a property looks like.
 
+Task affinity moved it the other way, 490 to 612 in `minicoro/` and 646 to
+786 in `coroutines/`. That is what adding real state looks like: three
+variables became arrays, so every use is an index check; `Ready` gained an
+argument, so its callers carry an extra obligation; and `Detach`, `Adopt` and
+`Register` are new subprograms with contracts of their own.
+
+Then the atomic reference count took `coroutines/` back down, 786 to 777, and
+`generators/` 813 to 804 — the same nine. (The procedure forms of `Create`
+and friends later took them to 829 and 856, which is new verified code rather
+than anything moving around.) **This one was checked, not
+assumed**, per the rule above. The nine are all runtime checks on arithmetic
+that no longer exists in SPARK code: six `Ref_Count + 1` / `- 1` sites in
+`Bump`, `Drop`, `Release`, `Claim_Slot`, `Current_Coroutine` and
+`Main_Coroutine`, each carrying an overflow and a range check, replaced by
+calls into `Minicoro.Atomics` whose body is `SPARK_Mode => Off`. The
+arithmetic moved into a trusted subprogram; it did not stop happening.
+
+What matters is that the *functional* property did not go with it, and that
+was confirmed by mutation. Making `Generator_Slots.Drop` set `Released` on
+every path still produces
+
+```
+medium: postcondition might fail, cannot prove
+        Released = (In_Use (S)'Old and then Ref_Count (S)'Old = 1)
+```
+
+so the reference-counting invariant is still proved, now discharged from
+`Atomics.Decrement`'s contract instead of from inline arithmetic. The
+`generators/` minus `coroutines/` difference is still exactly 27, which is
+`Generator_Slots`' own contribution and is unchanged.
+
 Each run takes roughly 10-40 minutes — start it in the background and do not
 poll it. `--level=3` also passes; `--report=statistics` if you want per-check
 detail.
 
-The default run is no longer warning-free: `Code_Page` came into SPARK and
-brings six warnings with it, all one fact — GNATprove does not model writes
-through an `Import` overlay at a computed address. See "What `Code_Page` being
-SPARK does and does not buy" below. Nothing else in the default run warns.
+The default run is not warning-free. `Code_Page` brings most of them, all one
+fact — GNATprove does not model writes through an `Import` overlay at a
+computed address; see "What `Code_Page` being SPARK does and does not buy"
+below. The one that is not `Code_Page` is
+
+```
+warning: pragma "Thread_Local_Storage" ignored (not yet supported)
+--> minicoro.adb
+```
+
+which is GNATprove stating the limitation recorded under "Threading model":
+it analyses `Me` as an ordinary variable, which is the right model for proofs
+that are all about one thread of control. Nothing else in the default run
+warns.
 
 `obj/gnatprove/gnatprove.out` holds the summary table; read lines 5-24.
 
@@ -171,7 +228,7 @@ Each of these was confirmed against GNATprove rather than assumed. Do not
 "clean them up" by flipping the pragma: the list below is what the tool
 actually rejects.
 
-### In `minicoro/` — six, all machine-level
+### In `minicoro/` — eight, six machine-level and two concurrent
 
 1. **`Minicoro.Contexts.Machine`** (body only; the spec is On). Two
    `Unchecked_Conversion` instances GNATprove refuses — *to* an
@@ -191,6 +248,18 @@ actually rejects.
 6. **`Minicoro.Trampoline_Entry`** — `Trampoline'Access`. "Access to
    subprogram with global effects is not allowed in SPARK", and the landing
    pad necessarily touches the pool.
+7. **`Minicoro.Atomics`** (private part and body; the visible part is On).
+   The counter's full view carries `Atomic`, which SPARK treats as
+   effectively volatile and would force any abstract state holding one to be
+   `External`; hiding it is what keeps the reference-counting postconditions
+   provable. See "Reference counts are atomic" under "Threading model".
+8. **`Minicoro.Threads`** (body only; the spec is On). One
+   `Atomic_Fetch_And_Add`, from
+   `System.Atomic_Operations.Integer_Arithmetic`, handing out thread
+   numbers. SPARK has no model of an atomic read-modify-write. This is the
+   only genuinely concurrent code in the tree, and its `Global => null` is
+   a claim about the Ada state SPARK reasons over rather than about the
+   counter, which nothing else observes. See "Threading model".
 
 The recurring hard errors behind those, for reference:
 
@@ -206,12 +275,25 @@ The recurring hard errors behind those, for reference:
 A different kind of list. Nothing here is about machine state; every item is
 a place where the published interface and the SPARK subset disagree.
 
-1. **`Create`, `Current_Coroutine`, `Main_Coroutine`** — `SPARK_Mode => Off`
-   on the *declarations*, not just the bodies. A SPARK function may not write
-   globals (`E0005`), and handing out a coroutine has to bump a reference
-   count. Marking only the body is not enough: GNATprove infers the global
-   and rejects the declaration. The slot bookkeeping is factored out into
-   `Claim_Slot`, which is analysed.
+1. **The `Create`, `Current_Coroutine`, `Main_Coroutine` *functions*** —
+   `SPARK_Mode => Off` on the *declarations*, not just the bodies. A SPARK
+   function may not write globals (`E0005`), and handing out a coroutine has
+   to bump a reference count. Marking only the body is not enough: GNATprove
+   infers the global and rejects the declaration.
+
+   Each of the three now also has a **procedure form**, which is `On` and
+   proved, because a procedure may write globals. That is not cosmetic: the
+   Off declarations are *contagious* to the caller —
+
+   ```
+   error: "C" is not allowed in SPARK (due to entity declared with
+          SPARK_Mode Off)
+   ```
+
+   on `C : constant Coroutine := Create (...)` — which took the client's whole
+   unit out of SPARK, race checking included. See "Proving a client" below.
+   The function forms stay for compatibility; every test in the tree uses
+   them.
 2. **`Spawn`, `Switch`, `Kill`** — they raise, and they are primitives of a
    tagged type. `aspect "Exceptional_Cases" on dispatching operation is not
    yet supported`, so there is no way to declare what comes out of them.
@@ -264,6 +346,58 @@ so plainly: `statement has no effect`, `unused assignment`, `"P" is not
 modified, could be IN`. It models `Write` as a no-op. The `[E0012]`
 `imprecise-address-specification` warning is the same limitation stated once.
 So `Code_Page` is analysed for its state machine, not for its effect.
+
+### Proving a client
+
+A SPARK program that uses coroutines can be analysed, and GNATprove will then
+report data races on *its own* variables. `coroutines/examples/spark_client`
+is a worked example that proves clean, and it is proof-only -- not built by
+`alr build`, not run by `alr test`, because its Ravenscar tasks do not
+terminate:
+
+```sh
+cd coroutines/examples/spark_client && gnatprove -P spark_client.gpr -j8 \
+  --report=fail
+```
+
+Expected: `Success: all checks proved (839 checks)`, 3 justified, 0 unproved,
+and an empty `Concurrency` row -- no data races.
+
+Four things a client needs, all found by trying:
+
+1. **The procedure forms of `Create`** and friends. The function forms are
+   `Off` and that is contagious; see the item above.
+2. **`pragma Elaborate_Body`** in any package declaring a delegate. Without it
+   the type extension is rejected with `E0003`, "first freezing point of type
+   must appear within early call region of primitive body" (SPARK RM 7.7(8)):
+   a dispatching call could otherwise reach `Run` before its body is
+   elaborated. `gnatprove --explain=E0003` gives exactly this fix.
+3. **The delegate's `Run` may touch only its own components.** It overrides an
+   abstract operation whose inferred `Global` is null, and SPARK RM 6.1.6
+   requires an override's `Global` to be subsumed by the overridden one's.
+   Reaching for a package variable gets `"X" is an In_Out of overriding
+   subprogram, but it is not an Input of overridden subprogram "Run"`. There
+   is no fix on the library side: a `Global` that covers every possible
+   override does not exist. Put the state in the delegate record.
+4. **Only one task may call into the library.** SPARK reports
+   `possible data race when accessing variable "coroutines.registry"`
+   otherwise, and it is right -- concurrent `Create` is the one operation
+   still unsynchronised. Note that `minicoro.affinity` will also be reported,
+   and *that* one is a false positive: it is the thread-local owner id, and
+   GNATprove does not model `Thread_Local_Storage`.
+
+The client's own allocator (`new Step`) draws
+`resource or memory leak might occur`, because `Delegate_Access` is a general
+access type and SPARK's ownership model does not track it. The example
+justifies it at the site with the obligation `Create` already documents:
+ownership transfers, so do not retain or free it.
+
+**Generators cannot be used from SPARK, and that is irreducible.** `Yield` is
+a dispatching operation that raises, and `Has_Next`/`Next`/`Element`/
+`Has_Element` are functions that advance the generator, so all of them write
+globals; the `Iterable` aspect fixes their profiles, so they cannot become
+procedures. A procedure form of `Generators.Create` would let a client build a
+generator it could not then use, so there is not one.
 
 ### How `generators/` got analysed, and why the tests still cannot be SPARK
 
@@ -381,7 +515,7 @@ cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail \
   --pedantic --proof-warnings=on
 ```
 
-`Success: all checks proved (490 checks)` and **20 warnings**:
+`Success: all checks proved (612 checks)` and **21 warnings**:
 
 | Count | Kind                                    | Group |
 |-------|-----------------------------------------|-------|
@@ -389,6 +523,7 @@ cd minicoro && gnatprove -P minicoro.gpr --level=2 -j4 --report=fail \
 | 7     | `Code_Page` overlay family              | 3     |
 | 1     | `unreachable code`                      | 4     |
 | 1     | `representation-attribute-value`        | 5     |
+| 1     | `ignored-pragma`                        | 7     |
 
 None of them has verification consequences any more.
 
@@ -429,7 +564,7 @@ instant `Contexts.Switch` returns.
 With `Current` and `Coros` havoc'd, the three `pragma Assume`s stopped being
 contradictions and became genuine restorations, and the postconditions are
 proved from them for real. The helper compiles to nothing, so there is no
-runtime effect; the 27-case suite was re-run to confirm it.
+runtime effect; the 33-case suite was re-run to confirm it.
 
 Do not write an explicit `Global` on `Transfer` itself — it would have to
 enumerate `Main_Ctx` and `Contexts.Backend_State`, and the child's state is
@@ -462,7 +597,7 @@ same-precedence predefined operators, so `A + B + C` may be evaluated as
 if an intermediate overflows, and none of these can — they are byte-range
 encoder arithmetic and small index sums.
 
-Sites: `minicoro.adb:519,544,570` (`Base + 1 + (I - Src'First)`),
+Sites: `minicoro.adb:856,881,907` (`Base + 1 + (I - Src'First)`),
 `minicoro-machine_code.adb:24` (`REX`), `:31` (`Mod_RM`), `:63` (`Put_Disp`'s
 precondition), `:178`, `:203`, `:243` (`P + 3 + Disp_Size (M)`),
 `minicoro-machine_code.ads:148` (`Subprogram_Variant`), `:238`
@@ -493,7 +628,7 @@ compiler disagree about the target
 GNATprove proves the `return True` inside `On_Linux` unreachable, i.e. that
 `Standard'Target_Name` never contains "linux". The compiler disagrees: on this
 machine `Standard'Target_Name` is `"x86_64-pc-linux-gnu"` (19 chars, "linux"
-at index 11), GNAT folds the search accordingly, and the 27-case suite passes
+at index 11), GNAT folds the search accordingly, and the 33-case suite passes
 — which it could not if `MAP_ANONYMOUS` came out as the BSD `0x1000` instead
 of Linux's `0x20`, because `mmap` would fail and `Create` would return
 `Make_Context_Error`.
@@ -519,12 +654,26 @@ is implementation-defined.
 `cannot unroll loop (too many loop iterations)` and `unrolling loop`.
 Informational; the loops carry invariants and prove fine. Nothing to do.
 
+### 7. `ignored-pragma` at `minicoro.adb:104` — GNATprove does not model
+thread-local storage
+
+```
+warning: pragma "Thread_Local_Storage" ignored (not yet supported)
+```
+
+Also in the **default** run, and the only default-run warning that is not
+`Code_Page`. GNATprove analyses `Me` as an ordinary variable, which is the
+right model for these proofs — every one of them is about one thread of
+control. What the pragma buys is that a second thread gets a second copy, to
+which each of those proofs still applies; that step is assumption 10 under
+"What is proved vs assumed". Nothing to fix.
+
 ### Resuming
 
 Family 1 is done. Family 2 is independent and can be skipped or done at
 leisure; families 3, 4 and 5 are tool limitations or deliberate trades, not
 work items. If you touch the lifecycle again, re-run the extended command
-above and confirm the count is still 20 with no `pragma Assume is always
+above and confirm the count is still 21 with no `pragma Assume is always
 False` among them — that warning reappearing is the signal that the re-entry
 model has drifted.
 
@@ -719,34 +868,234 @@ hand-written byte table anywhere in `minicoro/` — the only byte table is
 
 ## Threading model
 
-**Single-threaded, and load-bearing.** Every one of the 648 checks is proved
-under the assumption that one thread of control touches this library. Nothing
-in the tree creates a task, and there is not a single `protected`, `Atomic` or
-`Interrupt` construct in it — the only `Volatile` is `Anchor` in
-`Adopt_Current`, which is about observing a stack, not about concurrency.
+**Coroutines belong to one task, and moving one is an explicit operation.**
+This replaced an earlier, blunter rule ("single-threaded, and load-bearing"),
+and the reason it could be replaced cheaply is the same reason everything else
+here works: the state that was really per-thread became arrays indexed by a
+thread number, exactly as coroutines are arrays indexed by a coroutine number.
 
-All the state is unsynchronised globals: `Current`, `Main_Ctx`, `Backend_Up`,
-`Coros` and `Stores` in `Minicoro`; `Registry` and `Sched_State` in
-`Coroutines`; the four arrays in `Generator_Slots`. Two Ada tasks using any of
-this concurrently would race on all of it.
+Three variables at the bottom of the tree were per-thread all along and were
+not stored that way:
 
-The sharpest failure is not the pool but `Main_Ctx`. `Ensure_Backend` adopts
-the caller's stack *once*, guarded by `Backend_Up`, so whichever task gets
-there first has its stack recorded as "the main context". A second task
-switching would install the first task's stack pointer while running on its
-own — silent corruption, not an exception.
+| Was | Is now |
+|-----|--------|
+| `Minicoro.Main_Ctx` | `Main_Ctxs : array (Valid_Owner) of Context` |
+| `Minicoro.Current`  | `Currents : array (Valid_Owner) of Coroutine_Id` |
+| `Minicoro.Backend_Up` | `Backend_Up : array (Valid_Owner) of Boolean` |
 
-One asymmetry to know about, because it is worse than being uniformly
-single-threaded: the secondary-stack handling in `Coroutines.Raw` goes through
-`System.Soft_Links`, which *is* per-task in a tasking runtime. So the piece
-that looks most runtime-integrated is the one piece that would behave
-correctly under tasks, while everything around it silently would not.
+and one layer up, `Coroutines.Previous_Slot` and `Coroutines.Booted` went the
+same way, while the single reserved `Main_Slot` became the reserved *range*
+`Task_Slot` — slot N is task N's own main coroutine.
 
-### Reproducing the guarantee
+`Minicoro.Max_Owners` (16) is the ceiling. Numbers are handed out on first use
+and **never reused**, so it is a budget of threads over the life of the
+process, not of live threads; a program that spawns and joins tasks in a loop
+will exhaust it and start getting `Too_Many_Tasks`.
 
-For SPARK clients this is enforced, not merely documented — GNATprove rejects
-it. SPARK needs both pragmas below before it will look at tasking at all
-(`tasking in SPARK requires Ravenscar profile`, then `requires sequential
+### How a thread knows its own number
+
+One thread-local scalar, `Me` in `minicoro.adb`, and it is the only
+thread-local object in the tree:
+
+```ada
+Me : Owner_Id := No_Owner;
+pragma Thread_Local_Storage (Me);
+```
+
+`Minicoro.Current_Owner` is a plain read of it. Compiled at `-O2` the whole
+function body is
+
+```
+minicoro__current_owner:
+        movzbl %fs:0x0,%eax
+        ret
+```
+
+so an affinity check is one `%fs`-relative load and one compare, and the load
+inlines away at most call sites. No lock, no atomic on any hot path, and
+nothing that drags in the tasking runtime: a program with no tasks pays that
+and nothing else. (Confirm it the same way if you touch this — build
+`minicoro.adb` at `-O2` and `objdump -d minicoro.o`; the default build has no
+`-O` flag, so a debug build shows a stack frame and says nothing.)
+
+`Current_Owner` is a *function* and must stay one — it appears in contracts
+and inside other observers — so it cannot do the numbering, because a SPARK
+function may not write globals (E0005). The numbering is in `Ensure_Owner`,
+called only from `Ensure_Backend`, which is reached only from `Create`,
+`Adopt` and the public `Register`. A thread that merely observes never
+consumes a number.
+
+The counter behind it is the one genuinely concurrent thing in the tree:
+`Threads.Next_Owner`, a nested package whose spec is SPARK and whose body is
+`SPARK_Mode => Off`, doing one `Atomic_Fetch_And_Add` from
+`System.Atomic_Operations.Integer_Arithmetic` (Ada 2022, so not a GNAT
+private unit). Its counter type is deliberately much wider than `Max_Owners`:
+two threads can both pass the cheap pre-check and both increment, and a
+counter that stopped at `Max_Owners` would raise `Constraint_Error` on the
+second rather than simply refusing it.
+
+### The rule, and what enforces it
+
+Every operation that transfers control or frees a stack checks the owner and
+reports `Wrong_Task` (`Minicoro`) or raises `Coroutine_Error` (`Coroutines`,
+`Generators`). `Push`/`Pop`/`Peek` deliberately do **not** check: they touch a
+byte array and never a context, so they cannot put a thread on another
+thread's stack, and a task that has just adopted a coroutine legitimately
+wants to read what the previous owner pushed. Leaving them alone also keeps
+their (strong, proved) postconditions intact.
+
+What is *not* guarded, and on purpose: observers (`Alive`,
+`Owned_By_Current_Task`, `Is_Detached`, `"="`), copying a handle, and reading
+a value a generator has already yielded — `Generators.Next` hands back what is
+sitting in the slot without resuming anything. The line is control transfer,
+not reading. Probed empirically rather than assumed; from a foreign task:
+
+| Operation | Result |
+|---|---|
+| `C.Alive`, `C.Owned_By_Current_Task`, `C = C` | allowed |
+| copy of a handle (`Bump`) | allowed, and safe — the count is atomic |
+| `G.Next` on an already-yielded value | allowed |
+| `C.Spawn`, `C.Switch`, `C.Kill` | `Coroutine_Error` |
+| `C.Detach`, `C.Adopt`, `G.Detach`, `G.Adopt` | `Coroutine_Error` / `Generator_Error` |
+| `G.Has_Next` when it must actually resume | `Generator_Error` |
+
+That last row needed a fix to be true. `Generators.Advance` now tests
+ownership itself and raises `Generator_Error`; left to
+`Coroutines.Switch` it raised `Coroutine_Error`, which would have been the
+one place in that package where a caller saw a different exception. It cannot
+be done by wrapping the switch in a handler, because that switch legitimately
+propagates whatever the generator died of.
+
+`Detach` and `Adopt` are the move. Two operations rather than one because
+there is no handle on another thread to move a coroutine *to*: only the
+receiving thread can adopt, since adopting is what says "I may now switch to
+this". In between, the coroutine belongs to nobody and no thread may switch to
+it — which is what makes the hand-off safe without a lock, and is also exactly
+the work-stealing shape.
+
+`Minicoro.Detach` refuses (`Coroutine_Busy`) unless the coroutine is parked:
+not `Running`, and not `Awaited_By_Another`. That second predicate scans the
+pool for any live coroutine whose `Prev` names this one, and it is the
+condition that is easy to get wrong — if A resumed B, it is *B* that records
+the link, so looking only at A's own state would let A move out from under B.
+The scan is O(`Max_Coroutines`) and runs only on `Detach`.
+
+A successful `Detach` also clears `Prev` and forces the state to `Suspended`.
+Both matter: `Prev` would otherwise send the completion path back into the
+releasing task, and `Normal` — "active, but it resumed someone else" — would
+make the coroutine ineligible for `Resume` *and* for `Destroy`, so a detached
+generator's stack would leak. A generator sits in `Normal` between yields,
+because `Switch_To` puts the source there, so this is the common case rather
+than a corner one.
+
+### Two re-entry traps, both about stale owner numbers
+
+A coroutine's stack outlives the thread that last ran it. So **any local
+holding an owner number across a switch is stale after a migration**, and
+there are exactly two places where that matters:
+
+* `Minicoro.Trampoline` reads `Me` *after* the body returns, not on entry. The
+  thread that finishes a coroutine need not be the one that started it, and it
+  is the finishing thread whose `Main_Ctxs` entry we return to. It carries a
+  `pragma Assume (Ready (Owner))` for the same reason the other re-entry
+  assumptions exist.
+* `Coroutines.Switch_Slot` re-reads the owner after `Minicoro.Switch_To`
+  returns. That invocation may live on a coroutine's stack — `Yield_Slot` and
+  `Run` both call it — and everything after it indexes per-task state.
+
+  This one is defensive, and honestly so: it was not provoked by any test.
+  `Current_Slot` gives the right answer either way, because it goes through
+  `Minicoro.Running_Coroutine`, and `Detach` clears `Previous_Slot` for the
+  releasing task, which hides the difference in the obvious cases. What is
+  left is a genuine cross-task write — reading another task's
+  `Previous_Slot`, finding a `To_Clean` slot there and `Reset`ting it — that
+  needs a specific interleaving to reach. It was fixed by reasoning rather
+  than by a failing test, and reverting it does not make the suite fail.
+
+`Resume`, `Yield` and `Switch_To` do *not* need this: after their `Transfer`
+they do nothing but a `pragma Assume` and `Res := Success`, so a stale number
+has no runtime effect. `Coroutine_Wrapper` is correct by construction: it
+calls `Ensure_Booted` after `Run_Delegate` rather than before, which is the
+same discipline written a third way.
+
+`Control_Transferred` havocs `Coros` and `Currents` but deliberately **not**
+`Me`: the switch routine does not touch `%fs`, so the thread executing after
+it is the thread that was executing before it. Migration happens in the *gap*
+between switching out and being switched back in, not during the switch.
+
+### Reference counts are atomic; slot allocation is not
+
+**Handles are safe to share across tasks.** `Coroutines.Coroutine_Record.
+Ref_Count` and `Generator_Slots.Counts` are `Minicoro.Atomics.Counter`, so a
+handle may be copied and dropped on any task whether or not that task owns the
+coroutine. Lifetime and scheduling are different questions, and affinity
+guards only the second.
+
+That was not a theoretical fix. `coroutines/tests/test_shared_refcount` runs
+eight tasks copying and dropping one handle 50_000 times each; with the
+ordinary `if N < Natural'Last then N := N + 1` it aborts with `double free or
+corruption` inside a second, because lost increments drive the count to zero
+and release a slot the environment task still holds. With the atomic counter
+it is clean, under valgrind too.
+
+**The shape of the counter is dictated by SPARK**, and the obvious spelling
+does not work. An `Atomic` scalar in the pool array is *effectively volatile*
+to SPARK, so the enclosing abstract state has to be declared `External`:
+
+```
+error: non-external state "Slots" cannot contain external constituents in
+       refinement
+```
+
+and external state cannot be read in the ordinary expressions that
+`Generator_Slots`' contracts are made of. So `Minicoro.Atomics.Counter` is a
+private type whose full view is `SPARK_Mode => Off` — the same trick as
+`Contexts.Context` and `Stack_Handle` — with an observer `Value` and
+contracts saying what `Increment` and `Decrement` do. The prover never sees
+an `Atomic` aspect, and **`Generator_Slots.Drop`'s postcondition survives
+unchanged**, which was the thing worth protecting.
+
+`Decrement` returns `Was_Last` rather than letting the caller re-read the
+count, and that is the whole point: two tasks dropping the last two
+references both see a non-zero count if they look first, but exactly one of
+them is told it took the count to zero.
+
+What is trusted is that the body is *indivisible*; SPARK cannot check that.
+It was checked by experiment instead — eight tasks × 200_000 increments land
+on exactly 1_600_000, where a plain `Natural` lands around 600_000.
+
+**What is still not synchronised: concurrent `Create`.** `Claim_Slot` scans
+the shared pool for a free slot and then marks it, and those are two steps, so
+two tasks scanning together can pick the same one. Releasing concurrently is
+fine — that path is driven by the atomic count. Allocate on one task, hand the
+work out, and it does not arise.
+
+Fixing that properly is harder than it looks and was deliberately not
+attempted: a compare-and-swap claim is easy, but `Drop` takes the count to
+zero *and then* calls `Release`, so a claim keyed on the count would let
+another task take the slot while the first is still tearing it down. It needs
+a dying state or a claim keyed on `In_Use` with CAS, and `In_Use` is named in
+proved contracts throughout `Generator_Slots`.
+
+`coroutines/tests/test_task_affinity` checks the four refusals and a
+hand-over; `coroutines/tests/test_continue_after_move` is the paired case --
+the *same* `C.Switch` refused on a task that does not own the coroutine and
+accepted after the move, resuming at the next step rather than restarting;
+`coroutines/tests/test_shared_refcount` hammers the atomic count from eight
+tasks; `coroutines/tests/test_too_many_tasks` walks off the `Max_Owners`
+ceiling and confirms the surplus tasks are refused rather than given a number
+already in use; `generators/tests/test_work_stealing` runs eight detached
+generators across three worker tasks; `generators/tests/test_migrate_midway`
+alternates a single generator between two tasks on every yield. All four are
+golden-output tests
+and are deterministic despite the scheduling, because none of them prints
+anything that depends on which task won a race.
+
+### Reproducing the old guarantee
+
+For SPARK clients, a genuine data race is still reported rather than merely
+documented. SPARK needs both pragmas below before it will look at tasking at
+all (`tasking in SPARK requires Ravenscar profile`, then `requires sequential
 elaboration`):
 
 ```ada
@@ -766,19 +1115,19 @@ high: possible data race when accessing variable "minicoro.pool"
 
 reported once per abstract state — `minicoro.pool`, `minicoro.storage` and
 `minicoro.backend` separately, which is a direct dividend of splitting that
-state up. Note the check only fires when *two* tasks actually reach the state;
-a single task touching it raises nothing.
+state up. This is *correct*, not a false positive: the pool really is shared,
+and affinity does not change that. GNATprove does not model
+`Thread_Local_Storage` and analyses `Me` as an ordinary variable, which is the
+right reading for these proofs — they are all about one thread of control, and
+what the pragma buys is that a second thread gets a second copy to which every
+one of them still applies.
 
-This covers SPARK clients only. An ordinary Ada program gets no diagnostic.
+### Per-task pools: still not viable
 
-### Per-task pools: investigated, not viable as things stand
-
-Making the pools genuinely per-task — so that no affinity check is needed and
-a single-threaded program pays nothing — was tried. `pragma
-Thread_Local_Storage` is the obvious mechanism and it does work in principle;
-a `Natural` behind it gives each task its own copy, verified by experiment.
-
-It cannot be applied to these pools:
+Making the *pools* per-task, rather than only the three context variables, was
+tried and remains blocked. `pragma Thread_Local_Storage` accepts only an
+explicit `null`, a static expression or a static aggregate as the
+initialization:
 
 ```
 error: Thread_Local_Storage variable "Pool" is improperly initialized
@@ -787,24 +1136,30 @@ error: only allowed initialization is explicit "null", static expression or
 ```
 
 Every pool here has default component values, and `Coroutines.Excs` is an
-array of `Exception_Occurrence`, so all of them are rejected. Stripping the
-defaults to satisfy the pragma would reintroduce exactly the initialisation
-problem that the `Initializes` contracts were added to catch.
+array of `Exception_Occurrence`, so all of them are rejected. That is exactly
+why `Me` is a scalar. Stripping the defaults to satisfy the pragma would
+reintroduce the initialisation problem the `Initializes` contracts were added
+to catch.
 
-Two further obstacles, for the record. GNATprove does not model
-`Thread_Local_Storage`, so it would keep reporting the data race above as a
-false positive; and it cannot be silenced with `Abstract_State => (S with
-Synchronous)`, because that requires *"constituent of synchronized state must
-be synchronized"* — atomic or protected, neither of which a thread-local array
-is.
+The array-indexed-by-owner trick used for `Main_Ctxs`, `Currents` and
+`Backend_Up` does not extend to the pools either — not because it would not
+compile, but because it would multiply `Max_Coroutines * Max_Storage` by
+`Max_Owners` and, more to the point, would stop a coroutine being movable at
+all: a slot would belong to the thread whose sub-pool it came out of.
 
 The remaining route to real per-task pools is to stop having global state at
 all: pass an explicit scheduler object to every operation, so each task
 creates its own. That is zero-cost, is the best possible SPARK story (no
 globals means no data races by construction), and is a rewrite of the public
-API of all three layers plus all 27 tests. It has not been attempted.
+API of all three layers plus all 33 tests. It has not been attempted.
 
 ## What is proved vs assumed
+
+Affinity is proved to the same standard as the rest: the owner field is
+ordinary pool state, the checks are ordinary guards, and `Detach`/`Adopt` have
+postconditions (`Owner_Of (C) = No_Owner and then Status (C) = Suspended`, and
+`Owned_Here (C)`) that GNATprove discharges. What is *not* proved is anything
+about two threads at once -- see assumptions 9 to 11.
 
 Proved: all of `Machine_Code` (including `Resume_Point_Correct` and the
 displacement round trip), `Minicoro`'s absence of runtime errors, state guards
@@ -857,9 +1212,29 @@ Assumed, each marked in the source with its reasoning:
    `Init_Sec_Stack`, `Save_Sec_Stack` and `Restore_Sec_Stack` call through
    `System.Soft_Links`, whose effects SPARK cannot see.
 
+9. **A thread's number is stable across a context switch.**
+   `Control_Transferred` havocs `Coros` and `Currents` but not `Me`, because
+   the generated switch routine does not touch `%fs`. What it does not model
+   -- and what is therefore assumed -- is `Trampoline`'s
+   `pragma Assume (Ready (Owner))`: after the body returns, the thread may be
+   a *different* one that adopted the coroutine while it was parked, and the
+   claim is that whoever it is has its own backend up. `Adopt` establishes
+   that before it will hand ownership over.
+10. **`Thread_Local_Storage` gives each thread its own `Me`.** GNATprove says
+   plainly that it ignores the pragma (`pragma "Thread_Local_Storage" ignored
+   (not yet supported)`) and analyses `Me` as an ordinary variable. That is
+   the right reading for these proofs -- every one of them is about a single
+   thread of control -- but the step from "proved of one thread" to "holds of
+   each thread separately" rests on the pragma doing what it says.
+11. **The owner counter is atomic.** `Threads.Next_Owner` is outside SPARK and
+   is the only place two threads genuinely run at once. See "Threading
+   model".
+
 If you touch `Resume`/`Yield`/`Switch_To`/`Trampoline`, re-check that the
 assumptions still match what the counterpart routine actually restores. They
-are the load-bearing part of the lifecycle argument.
+are the load-bearing part of the lifecycle argument. `Trampoline` in
+particular now has *two* things to get right: what the counterpart restores,
+and which thread it is running on.
 
 ## The two papers
 
@@ -913,7 +1288,7 @@ destroyed while the coroutine ran.
 - Only x86-64 is implemented (Win64 and System V). Other architectures need
   their own encoder. minicoro itself also has ucontext, fibers and Asyncify
   backends; none are ported.
-- The POSIX `Code_Page` body (`mmap`/`mprotect`) now runs: the full 27-case
+- The POSIX `Code_Page` body (`mmap`/`mprotect`) now runs: the full 30-case
   suite passes on x86-64 Linux under GNAT 16.1, which exercises it together
   with the System V switch routine. macOS and the BSDs are still untested —
   `MAP_ANONYMOUS` differs there and `On_Linux` picks the value by inspecting
@@ -931,5 +1306,28 @@ destroyed while the coroutine ran.
   carries no *functional* postconditions — nothing states what `Switch` does
   to the pool, only that it cannot go wrong. Contracts in the style of
   `Minicoro.Resume`/`Yield` would be the next real strengthening.
+- **Concurrent `Create` is the one operation still unsynchronised.**
+  `Claim_Slot` scans the shared pool for a free slot and then marks it, in two
+  steps, so two tasks scanning together can pick the same one. Everything else
+  a second task can do is now either checked (control transfer) or safe
+  (reference counting, which is atomic). A compare-and-swap claim is not
+  enough on its own: `Drop` takes the count to zero and *then* calls
+  `Release`, so a claim keyed on the count would hand the slot out while the
+  first task is still tearing it down. It needs a dying state, or a claim
+  keyed on `In_Use` with CAS — and `In_Use` is named in proved contracts
+  throughout `Generator_Slots`.
+- **There is no scheduler, and "work stealing" here is not what Go or Tokio
+  mean by it.** Both of those have a per-worker run queue and steal half of a
+  victim's; you call `spawn` and never name a target. This library has no run
+  queue at all — the caller says `C.Switch`. `test_work_stealing` has the
+  *application* holding the queue, which is real but is a different thing.
+  Adding a genuine scheduler would also make `Detach`/`Adopt` largely
+  redundant: with the scheduler owning the queues, migration is "pop from
+  another worker's deque" and needs no handshake. Worth knowing before
+  building anything more on top of the current hand-off.
+- `Max_Owners` is 16 and thread numbers are never reused, so a program that
+  spawns and joins tasks in a loop exhausts it. A free list would fix that,
+  at the price of having to prove that no coroutine still records a number
+  being reused.
 - The user pushes to their own fork
   (`https://github.com/ValorZard/ada-generators-slop.git`) themselves.

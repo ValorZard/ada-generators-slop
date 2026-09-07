@@ -24,4 +24,16 @@ package body Support is
       Put_Line ("Last Hello, world!");
    end Run;
 
+   ---------
+   -- Run --
+   ---------
+
+   overriding procedure Run (D : in out Stepper) is
+   begin
+      for I in 1 .. D.Steps loop
+         Ada.Text_IO.Put_Line ("   coroutine: step" & Integer'Image (I));
+         Coroutines.Main_Coroutine.Switch;
+      end loop;
+   end Run;
+
 end Support;
