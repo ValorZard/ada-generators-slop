@@ -425,6 +425,22 @@ Together those meant the generic produced *zero* checks no matter what was
 done to it, and no test could help: any SPARK unit instantiating `Generators`
 fails identically. Making the tests SPARK is not the missing ingredient.
 
+Two ways round that look plausible and are not. Both were run against
+GNATprove 16.1 rather than reasoned about:
+
+- **`Side_Effects`** (SPARK 2022's functions-with-side-effects) lets a
+  function write globals, which is exactly the `E0005` obstacle — but it makes
+  the function volatile, and the aspect rejects those by name: `volatile
+  function associated with aspect Iterable is not allowed in SPARK`.
+- **Hoisting more state out of the generic**, the `Generator_Slots` trick
+  applied to `Coro`/`Caller`, does not rescue the `Iterable` four either. An
+  instantiation draws `function associated to aspect Iterable with dependency
+  on globals is not allowed in SPARK` — *depends on*, not writes, so `Element`
+  is refused for merely reading the pool. Hoisting moves where the globals
+  live; the rule is about touching globals at all. It would still get the
+  coroutine plumbing analysed, which is why it stays on the list under "Not
+  done" — just know it is a partial win.
+
 **The way round is `Generator_Slots`.** Six of the seven fields in the old
 `Generator_Record` did not depend on the formal type at all. Hoisted into a
 non-generic package they are analysed directly, no instantiation involved:
