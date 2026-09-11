@@ -1,6 +1,8 @@
 Ada 2022 - Generators/Coroutines prototype
 ==========================================
 
+(Note: A lot of this code is AI-Generated, and is a hard fork of this repository: https://github.com/pmderodat/ada-generators)
+
 This repository hosts a prototype for generators/coroutines support in Ada.
 This prototype includes:
 
