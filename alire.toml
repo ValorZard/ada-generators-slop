@@ -33,3 +33,6 @@ gnat = ">=13"
 [[actions]]
 type = "test"
 command = ["python3", "run_tests.py"]
+
+[[depends-on]]
+gnatprove = "^16.1.0"
